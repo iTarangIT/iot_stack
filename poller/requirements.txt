@@ -1,0 +1,4 @@
+aiohttp==3.9.5
+asyncpg==0.29.0
+redis[hiredis]==5.0.4
+apscheduler==3.10.4

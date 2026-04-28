@@ -1,0 +1,310 @@
+name: Deploy IoT Stack to VPS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploys the Itarang IoT stack (poller + aggregator + risk-sandbox) to the
+# VPS. Everything runs in docker compose; this workflow SSHes in, pulls,
+# rebuilds changed images, and recreates only affected containers.
+#
+# REPO LAYOUT (matches /opt/intellicar/ on the VPS):
+#   docker-compose.yml             ← orchestrator (replaces storage/docker-compose.yml)
+#   schema.sql                     ← Postgres bootstrap (first-init only)
+#   schema/dashboard_aggregates.sql ← dashboard_* tables + agg DDL
+#   poller/                        ← Dockerfile + poll.py + requirements.txt
+#   aggregator/                    ← Python scheduled jobs (NEW)
+#   risk-sandbox/                  ← FastAPI sandbox for LangGraph
+#   scripts/                       ← dev tools (fetch_intellicar.py)
+#   legacy/                        ← retired PHP dashboard + phase*.sh
+#
+# VPS LAYOUT:
+#   /opt/intellicar/               ← repo clone (APP_DIR)
+#   /opt/intellicar/.env           ← written each deploy from IOT_ENV_FILE_B64
+#   docker compose v2 + git installed; root is the deploy user.
+#
+# REQUIRED GITHUB SECRETS:
+#   IOT_VPS_HOST            VPS hostname/IP (e.g. 72.61.246.37)
+#   IOT_VPS_USER            SSH user (root)
+#   IOT_VPS_PORT            SSH port
+#   IOT_VPS_SSH_KEY         private key (matches /root/.ssh/authorized_keys)
+#   IOT_ENV_FILE_B64        base64 of full .env (PG_PASSWORD, INTELLICAR_*,
+#                           NBFC_RDS_DSN_RO)
+#   SLACK_WEBHOOK_URL       optional — slack notifications no-op if missing
+#
+# SCHEMA MIGRATIONS:
+#   schema.sql + schema/*.sql are loaded ONLY on first postgres init via
+#   /docker-entrypoint-initdb.d/. Changes after first init must be applied
+#   manually:
+#       docker exec -i itarang_postgres psql -U intellicar -d intellicar < migration.sql
+#   The "Detect schema changes" step refuses to deploy if either file changed
+#   since the last commit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-iot-stack
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # ──────────────────────────────────────────────────────────────────
+      # 1. Slack notify start
+      # ──────────────────────────────────────────────────────────────────
+      - name: Slack notify start
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          MSG=$(printf '%s' "${{ github.event.head_commit.message }}" | head -c 200 | sed 's/"/\\"/g')
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\":satellite_antenna: *IoT stack deploy started* \`${{ github.sha }}\`\nby ${{ github.actor }} — \`${MSG}\`\n${{ github.event.head_commit.url }}\"}" \
+            "$SLACK_WEBHOOK_URL" || true
+
+      # ──────────────────────────────────────────────────────────────────
+      # 2. Checkout — needed to detect schema changes
+      # ──────────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      # ──────────────────────────────────────────────────────────────────
+      # 3. Migration safety: refuse if schema.sql or schema/*.sql changed.
+      #    Apply manually inside the postgres container first, then re-trigger.
+      # ──────────────────────────────────────────────────────────────────
+      - name: Detect schema changes
+        id: schema_check
+        run: |
+          BASE_SHA=$(git log -2 --format=%H | tail -1)
+          CHANGED=$(git diff --name-only "$BASE_SHA"..HEAD -- schema.sql 'schema/*.sql' 'migrations/*.sql' 2>/dev/null || true)
+          if [ -n "$CHANGED" ]; then
+            echo "::error::Schema files changed since $BASE_SHA:"
+            echo "$CHANGED" | sed 's/^/  - /'
+            echo "::error::Apply the SQL MANUALLY via 'docker exec -i itarang_postgres psql ...' FIRST, then re-trigger this workflow."
+            echo "::error::See IOT_DEPLOY_README.md → 'Migration policy'."
+            exit 1
+          fi
+          echo "No schema changes. Safe to deploy."
+
+      # ──────────────────────────────────────────────────────────────────
+      # 4. SSH deploy
+      # ──────────────────────────────────────────────────────────────────
+      - name: SSH deploy IoT stack
+        id: ssh_deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.IOT_VPS_HOST }}
+          username: ${{ secrets.IOT_VPS_USER }}
+          port: ${{ secrets.IOT_VPS_PORT }}
+          key: ${{ secrets.IOT_VPS_SSH_KEY }}
+          command_timeout: 25m
+          script_stop: false        # see deploy-production.yml retro
+          script: |
+            set -eo pipefail
+            exec 2>&1               # surface stderr through drone-ssh
+            set -x
+            APP_DIR=/opt/intellicar
+            cd "$APP_DIR"
+
+            echo "::group::Capture PREV_SHA for rollback"
+            PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+            echo "$PREV_SHA" > /tmp/itarang-iot-prev-sha
+            echo "PREV_SHA=$PREV_SHA"
+            echo "::endgroup::"
+
+            echo "::group::Pull latest main"
+            git fetch origin main
+            git reset --hard origin/main
+            NEW_SHA=$(git rev-parse HEAD)
+            git log -1 --oneline
+            echo "::endgroup::"
+
+            echo "::group::Write .env from secret"
+            umask 077
+            echo "${{ secrets.IOT_ENV_FILE_B64 }}" | base64 -d | tr -d '\r' > .env
+            chmod 600 .env
+            echo "Wrote .env ($(wc -l < .env) lines, $(wc -c < .env) bytes)"
+            echo "::endgroup::"
+
+            echo "::group::Verify docker daemon + compose v2"
+            docker version --format '{{.Server.Version}}' || { echo "❌ docker daemon not reachable"; exit 1; }
+            docker compose version || { echo "❌ docker compose v2 plugin missing"; exit 1; }
+            echo "::endgroup::"
+
+            echo "::group::Pull base images (postgres, redis)"
+            docker compose pull --ignore-buildable || true
+            echo "::endgroup::"
+
+            echo "::group::Build app images (poller + aggregator + risk-sandbox)"
+            DOCKER_BUILDKIT=1 docker compose build --pull
+            echo "::endgroup::"
+
+            echo "::group::Recreate changed containers (up -d --remove-orphans)"
+            # --remove-orphans drops the retired itarang_dashboard container
+            # the first time this runs after the PHP dashboard removal.
+            docker compose up -d --remove-orphans
+            echo "::endgroup::"
+
+            echo "::group::docker compose ps"
+            docker compose ps
+            echo "::endgroup::"
+
+            # ──────────────────────────────────────────────────────────────
+            # Health checks
+            # ──────────────────────────────────────────────────────────────
+            echo "::group::Health: postgres pg_isready"
+            HTTP=fail
+            for i in $(seq 1 60); do
+              sleep 1
+              if docker compose exec -T postgres pg_isready -U intellicar > /dev/null 2>&1; then
+                HTTP=ok; echo "postgres healthy after ${i}s"; break
+              fi
+            done
+            if [ "$HTTP" != "ok" ]; then
+              echo "❌ postgres pg_isready never returned 0"
+              docker compose logs --tail=80 postgres || true
+              exit 1
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Health: redis ping"
+            HTTP=fail
+            for i in $(seq 1 30); do
+              sleep 1
+              if docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q PONG; then
+                HTTP=ok; echo "redis healthy after ${i}s"; break
+              fi
+            done
+            if [ "$HTTP" != "ok" ]; then
+              echo "❌ redis never returned PONG"
+              docker compose logs --tail=80 redis || true
+              exit 1
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Health: risk-sandbox 127.0.0.1:8091/health"
+            HTTP=000
+            for i in $(seq 1 60); do
+              sleep 1
+              HTTP=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://127.0.0.1:8091/health || echo 000)
+              if [ "$HTTP" = "200" ]; then echo "risk-sandbox healthy after ${i}s"; break; fi
+            done
+            if [ "$HTTP" != "200" ]; then
+              echo "❌ risk-sandbox /health returned $HTTP after 60s"
+              docker compose logs --tail=80 risk-sandbox || true
+              exit 1
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Health: poller actually polling"
+            STATUS=$(docker inspect -f '{{.State.Status}}' itarang_poller 2>/dev/null || echo "missing")
+            if [ "$STATUS" != "running" ]; then
+              echo "❌ itarang_poller status=$STATUS"
+              docker compose logs --tail=100 poller || true
+              exit 1
+            fi
+            FOUND=no
+            for i in $(seq 1 60); do
+              sleep 1
+              if docker compose logs --tail=200 poller 2>/dev/null | grep -qiE 'polling|fetched|state cycle|roster'; then
+                FOUND=yes; echo "poller log shows activity after ${i}s"; break
+              fi
+            done
+            if [ "$FOUND" != "yes" ]; then
+              echo "⚠️  poller running but no recognised log activity in 60s — check INTELLICAR_USERNAME/PASSWORD"
+              docker compose logs --tail=120 poller || true
+              # Non-fatal — credential failures are a separate class.
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Health: aggregator scheduler started + first job fired"
+            STATUS=$(docker inspect -f '{{.State.Status}}' itarang_aggregator 2>/dev/null || echo "missing")
+            if [ "$STATUS" != "running" ]; then
+              echo "❌ itarang_aggregator status=$STATUS"
+              docker compose logs --tail=120 aggregator || true
+              exit 1
+            fi
+            FOUND=no
+            for i in $(seq 1 90); do
+              sleep 1
+              if docker compose logs --tail=200 aggregator 2>/dev/null | grep -q 'scheduler started'; then
+                FOUND=yes; echo "aggregator scheduler started after ${i}s"; break
+              fi
+            done
+            if [ "$FOUND" != "yes" ]; then
+              echo "❌ aggregator scheduler never reported started in 90s"
+              docker compose logs --tail=200 aggregator || true
+              exit 1
+            fi
+            # Bonus: check aggregator_runs row count climbed in the last 2min.
+            RECENT_RUNS=$(docker compose exec -T postgres psql -U intellicar -d intellicar -tAc \
+              "SELECT COUNT(*) FROM aggregator_runs WHERE started_at > now() - interval '2 minutes'" \
+              2>/dev/null || echo 0)
+            echo "aggregator_runs in last 2min: $RECENT_RUNS"
+            if [ "${RECENT_RUNS:-0}" = "0" ]; then
+              echo "⚠️  no aggregator runs persisted yet — may be normal on cold start. Check after 5min."
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Disk + image hygiene"
+            docker image prune -f --filter "until=168h" || true
+            df -h | head -5
+            echo "::endgroup::"
+
+            echo "✅ IoT stack deploy complete: $(git rev-parse --short HEAD)"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 5. Rollback on failure
+      # ──────────────────────────────────────────────────────────────────
+      - name: SSH rollback (only on deploy failure)
+        if: failure() && steps.ssh_deploy.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.IOT_VPS_HOST }}
+          username: ${{ secrets.IOT_VPS_USER }}
+          port: ${{ secrets.IOT_VPS_PORT }}
+          key: ${{ secrets.IOT_VPS_SSH_KEY }}
+          command_timeout: 15m
+          script_stop: false
+          script: |
+            set -eo pipefail
+            exec 2>&1
+            APP_DIR=/opt/intellicar
+            cd "$APP_DIR"
+            PREV_SHA=$(cat /tmp/itarang-iot-prev-sha 2>/dev/null || echo "")
+            CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+            if [ -z "$PREV_SHA" ] || [ "$PREV_SHA" = "$CURRENT_SHA" ]; then
+              echo "No rollback needed (PREV_SHA missing or already at PREV_SHA)"
+              exit 0
+            fi
+            echo "Rolling back IoT stack to $PREV_SHA"
+            git reset --hard "$PREV_SHA"
+            if [ -f .env ]; then sed -i 's/\r$//' .env; fi
+            DOCKER_BUILDKIT=1 docker compose build --pull
+            docker compose up -d --remove-orphans
+            echo "✅ Rolled back IoT stack to $PREV_SHA"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 6. Slack notify result
+      # ──────────────────────────────────────────────────────────────────
+      - name: Slack notify result
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ "${{ steps.ssh_deploy.outcome }}" = "success" ]; then
+            ICON=":white_check_mark:"
+            STATUS="*succeeded*"
+          else
+            ICON=":x:"
+            STATUS="*FAILED* — rollback ${{ job.status }}"
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\"${ICON} IoT stack deploy ${STATUS} \`${{ github.sha }}\`\nLogs: ${RUN_URL}\"}" \
+            "$SLACK_WEBHOOK_URL" || true

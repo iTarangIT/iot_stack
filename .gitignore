@@ -1,0 +1,47 @@
+# ─── Secrets — NEVER commit ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+.scripts/.env
+
+# ─── Postgres data volume (managed by docker, never in repo) ────────────────
+pgdata/
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Python build artifacts ─────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Backups (we cleaned these up; keep gitignored for the future) ──────────
+*.bak
+*.bak.*
+docker-compose.yml.bak.*
+
+# ─── Editor / OS junk ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Node (in case anyone adds JS tooling later) ────────────────────────────
+node_modules/
+
+# ─── Sample data dumps from fetch_intellicar.py ─────────────────────────────
+sample-data/
+
+# ─── Local dev caches ───────────────────────────────────────────────────────
+.last-npm-install-hash
