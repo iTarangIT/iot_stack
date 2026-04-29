@@ -1,16 +1,17 @@
 """
 nbfc_loan_iot_join — the cross-source join that justifies this whole container.
 
-Pulls the active NBFC loan list (with vehicleno) from AWS RDS, pulls
-24h IoT activity per vehicle from local Timescale, joins in pandas, and
-upserts into dashboard_nbfc_loans_with_iot for the CRM /nbfc/risk page.
+Pulls the active NBFC loan list (with vehicleno) from AWS RDS, pulls the
+current per-vehicle state from local Timescale (vehicle_state, maintained
+by poll.py), joins on vehicleno in pandas, and upserts into
+dashboard_nbfc_loans_with_iot for the CRM /nbfc/risk page.
 
-Why pandas instead of dblink/FDW:
-  - RDS lives in a different VPC. Postgres FDW would need network rules
-    we don't want to maintain.
-  - The join is small (active loans count, not millions of rows). Pulling
-    both sides into memory and merging is simpler and faster than tunneling
-    one side through the other.
+Why pandas over Postgres FDW / dblink:
+  - RDS lives in a different VPC. FDW would require network rules we don't
+    want to maintain.
+  - Active-loan count stays small (thousands, not millions). Pulling both
+    sides into memory and merging is simpler and faster than tunneling one
+    through the other.
 """
 from __future__ import annotations
 
@@ -22,79 +23,85 @@ DEFAULT_INTERVAL_SECONDS = 300
 
 
 # ─── source A: NBFC loans on AWS RDS (read-only) ─────────────────────────────
-# TODO: confirm exact column names against drizzle/0033_nbfc_dashboard.sql.
-# Likely candidates from the schema we set up: nbfc_loans (loan_id, borrower_id,
-# vehicle_no, dpd_days, principal_outstanding, status, tenant_id, …).
+# Schema confirmed against drizzle/0033_nbfc_dashboard.sql + RDS introspection.
 RDS_SQL = """
 SELECT
-    loan_id,
-    borrower_id,
-    vehicle_no       AS vehicleno,
-    tenant_id,
-    dpd_days,
-    principal_outstanding,
-    status
+    loan_application_id,
+    tenant_id::text       AS tenant_id,
+    vehicleno,
+    emi_amount,
+    emi_due_date_dom,
+    current_dpd,
+    outstanding_amount,
+    is_active
 FROM nbfc_loans
-WHERE status IN ('active', 'overdue')
-  AND vehicle_no IS NOT NULL
+WHERE is_active = TRUE
+  AND vehicleno IS NOT NULL
 """
 
-# ─── source B: IoT 24h activity per vehicle on local Timescale ───────────────
+# ─── source B: current IoT state per vehicle on local Timescale ─────────────
+# vehicle_state is upserted by poll.py on every poll cycle. We grab whatever's
+# there now — staleness is signalled by `last_seen` and `online`.
 IOT_SQL = """
 SELECT
     vehicleno,
-    MAX(ts)                         AS last_seen,
-    AVG(soc)                        AS soc_avg_24h,
-    MIN(soc)                        AS soc_min_24h,
-    SUM(distance_delta_km)          AS distance_24h_km,
-    BOOL_OR(ignition)               AS ignition_24h,
-    COUNT(*)                        AS samples_24h
-FROM state_history
-WHERE ts > now() - interval '24 hours'
-GROUP BY vehicleno
+    last_seen,
+    soc_pct,
+    online,
+    lat,
+    lon,
+    open_alert_count
+FROM vehicle_state
 """
 
 UPSERT_SQL = """
 INSERT INTO dashboard_nbfc_loans_with_iot
-    (loan_id, borrower_id, vehicleno, tenant_id, dpd_days,
-     principal_outstanding, status,
-     last_seen, soc_avg_24h, soc_min_24h, distance_24h_km, samples_24h,
+    (loan_application_id, tenant_id, vehicleno,
+     emi_amount, emi_due_date_dom, current_dpd, outstanding_amount, is_active,
+     last_seen, soc_pct, online, lat, lon, open_alert_count,
      refreshed_at)
 VALUES
-    (%(loan_id)s, %(borrower_id)s, %(vehicleno)s, %(tenant_id)s, %(dpd_days)s,
-     %(principal_outstanding)s, %(status)s,
-     %(last_seen)s, %(soc_avg_24h)s, %(soc_min_24h)s, %(distance_24h_km)s,
-     %(samples_24h)s, now())
-ON CONFLICT (loan_id) DO UPDATE SET
-    borrower_id           = EXCLUDED.borrower_id,
-    vehicleno             = EXCLUDED.vehicleno,
-    tenant_id             = EXCLUDED.tenant_id,
-    dpd_days              = EXCLUDED.dpd_days,
-    principal_outstanding = EXCLUDED.principal_outstanding,
-    status                = EXCLUDED.status,
-    last_seen             = EXCLUDED.last_seen,
-    soc_avg_24h           = EXCLUDED.soc_avg_24h,
-    soc_min_24h           = EXCLUDED.soc_min_24h,
-    distance_24h_km       = EXCLUDED.distance_24h_km,
-    samples_24h           = EXCLUDED.samples_24h,
-    refreshed_at          = EXCLUDED.refreshed_at;
+    (%(loan_application_id)s, %(tenant_id)s, %(vehicleno)s,
+     %(emi_amount)s, %(emi_due_date_dom)s, %(current_dpd)s,
+     %(outstanding_amount)s, %(is_active)s,
+     %(last_seen)s, %(soc_pct)s, %(online)s, %(lat)s, %(lon)s,
+     %(open_alert_count)s,
+     now())
+ON CONFLICT (loan_application_id) DO UPDATE SET
+    tenant_id          = EXCLUDED.tenant_id,
+    vehicleno          = EXCLUDED.vehicleno,
+    emi_amount         = EXCLUDED.emi_amount,
+    emi_due_date_dom   = EXCLUDED.emi_due_date_dom,
+    current_dpd        = EXCLUDED.current_dpd,
+    outstanding_amount = EXCLUDED.outstanding_amount,
+    is_active          = EXCLUDED.is_active,
+    last_seen          = EXCLUDED.last_seen,
+    soc_pct            = EXCLUDED.soc_pct,
+    online             = EXCLUDED.online,
+    lat                = EXCLUDED.lat,
+    lon                = EXCLUDED.lon,
+    open_alert_count   = EXCLUDED.open_alert_count,
+    refreshed_at       = EXCLUDED.refreshed_at;
 """
 
 
 def run(iot, rds, log) -> int:
-    # Pull both sides
     loans = pd.read_sql(RDS_SQL, rds)
     if loans.empty:
         log.info("no active loans with vehicleno on RDS — nothing to join")
         return 0
 
-    iot_24h = pd.read_sql(IOT_SQL, iot)
-    log.info("pulled %d loans, %d vehicles with 24h activity", len(loans), len(iot_24h))
+    iot_state = pd.read_sql(IOT_SQL, iot)
+    log.info(
+        "pulled %d active loans, %d vehicles in vehicle_state",
+        len(loans), len(iot_state),
+    )
 
-    # Left-join: every active loan gets a row even if no IoT samples in 24h.
-    merged = loans.merge(iot_24h, on="vehicleno", how="left")
+    # Left join — every active loan keeps a row even if no IoT state exists
+    # yet (new vehicle not polled, or device offline since deploy).
+    merged = loans.merge(iot_state, on="vehicleno", how="left")
 
-    # Coerce nan→None so psycopg writes SQL NULL, not the string 'nan'
+    # nan → None so psycopg writes SQL NULL, not 'NaN'
     merged = merged.where(pd.notnull(merged), None)
 
     rows = merged.to_dict("records")
