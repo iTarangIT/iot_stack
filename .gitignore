@@ -45,3 +45,6 @@ sample-data/
 
 # ─── Local dev caches ───────────────────────────────────────────────────────
 .last-npm-install-hash
+
+# SSH keys / credentials
+keys/
