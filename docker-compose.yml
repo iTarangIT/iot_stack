@@ -108,6 +108,34 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  monitor:
+    build: ./monitor
+    container_name: itarang_monitor
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    environment:
+      PG_DSN:           "postgresql://intellicar:${PG_PASSWORD}@postgres:5432/intellicar"
+      REDIS_URL:        "redis://redis:6379/0"
+      RISK_SANDBOX_URL: "http://risk-sandbox:8000"
+      MONITOR_USER:     ${MONITOR_USER}
+      MONITOR_PASS:     ${MONITOR_PASS}
+    volumes:
+      # Read-only docker socket — we only call list/inspect/logs, never run.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      # Bound to loopback; Caddy on the host fronts the public hostname.
+      - "127.0.0.1:8092:8000"
+    healthcheck:
+      # python:slim has no curl/wget; use stdlib. /healthz is unauthenticated
+      # and just confirms the server process is alive.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   risk-sandbox:
     build: ./risk-sandbox
     container_name: itarang_risk_sandbox

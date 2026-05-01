@@ -46,6 +46,7 @@ The PHP "dashboard" container that used to ship with this stack is **retired**. 
 | `poller`      | (no port)         | `./poller`         | Polls Intellicar API → writes Timescale + Redis.              |
 | `aggregator`  | (no port)         | `./aggregator`     | APScheduler-driven Python jobs → cross-source joins → dashboard_* tables. |
 | `risk-sandbox`| `127.0.0.1:8091`  | `./risk-sandbox`   | FastAPI sandbox for LangGraph hypothesis runs from /nbfc/risk. |
+| `monitor`     | `127.0.0.1:8092`  | `./monitor`        | HTML/JSON status page (containers, health, freshness). Behind Caddy + basic auth. |
 
 `postgres` is bound to `0.0.0.0:5433` because the Next.js CRM (sandbox + production) connects from outside the VPS. Lock this down with UFW IP allowlist or Tailscale before this is anything other than dev data.
 
@@ -70,6 +71,9 @@ INTELLICAR_USERNAME=<…>
 INTELLICAR_PASSWORD=<…>
 # DSN for the read-only NBFC user on AWS RDS — aggregator reads this.
 NBFC_RDS_DSN_RO=postgresql://nbfc_ro:<pwd>@<rds-endpoint>:5432/<db>?sslmode=require
+# Basic-auth credentials for the HTML status page at iot-status.itarang.com
+MONITOR_USER=admin
+MONITOR_PASS=<long-random>
 ```
 
 To turn into a secret value:
@@ -146,6 +150,24 @@ def run(iot, rds, log) -> int:
 
 The scheduler auto-discovers it on next deploy.
 
+## Monitoring page
+
+A live HTML status page (containers, health pings, postgres data freshness, host stats) ships as the `monitor` service. It reads the docker socket read-only, queries postgres/redis/risk-sandbox over the internal compose network, and serves both a single-page HTML at `/` and JSON at `/api/status`. Auto-refreshes every 5s.
+
+The container binds `127.0.0.1:8092` only — expose it through Caddy.
+
+**Caddy site (host-side, e.g. `/etc/caddy/Caddyfile.d/iot-status.conf`):**
+
+```
+iot-status.itarang.com {
+    reverse_proxy 127.0.0.1:8092
+}
+```
+
+Reload Caddy (`systemctl reload caddy`) and the page is live at `https://iot-status.itarang.com/`. Basic auth is enforced inside the FastAPI app using `MONITOR_USER` / `MONITOR_PASS` from `.env`, so Caddy stays a plain reverse proxy.
+
+If you ever want to point Uptime Kuma at it, hit `/api/status` with the same basic-auth credentials and alert on `health.postgres.ok=false` etc.
+
 ## Rollback
 
 Triggered automatically on health-check failure — restores `PREV_SHA`, rebuilds. Manual rollback:
@@ -194,6 +216,11 @@ iot_stack/
 ├── risk-sandbox/                ← from VPS
 │   ├── Dockerfile
 │   └── executor.py
+├── monitor/                     ← live HTML status page
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── app.py
+│   └── index.html
 ├── scripts/                     ← from VPS
 │   └── fetch_intellicar.py
 ├── legacy/                      ← retired; reference only
