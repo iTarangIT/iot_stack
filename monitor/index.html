@@ -116,6 +116,58 @@
     color: var(--text);
   }
   .endpoint-name { color: var(--blue); }
+  /* ── table samples ── */
+  .sample-block {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .sample-block summary {
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .sample-block summary::-webkit-details-marker { display: none; }
+  .sample-block summary::before {
+    content: "▸ ";
+    color: var(--muted);
+    margin-right: 4px;
+  }
+  .sample-block[open] summary::before { content: "▾ "; }
+  .sample-block summary .meta {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: normal;
+  }
+  .sample-block .table-wrap {
+    overflow-x: auto;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .sample-block table {
+    border-radius: 0;
+    border: none;
+    margin: 0;
+    width: max-content;
+    min-width: 100%;
+  }
+  .sample-block th, .sample-block td {
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+    padding: 6px 12px;
+    font-size: 11px;
+  }
+  .sample-block td.cell-empty { color: var(--muted); font-style: italic; }
+  .sample-block .empty-msg { padding: 12px 14px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .sample-block .err-msg   { padding: 12px 14px; color: var(--red);   font-size: 12px; font-family: var(--mono); }
   .host-line { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   /* ── architecture diagram ── */
   .arch-wrap {
@@ -304,6 +356,10 @@
       </table>
     </section>
     <section>
+      <h2>Recent rows (latest 5 per table)</h2>
+      <div id="samples"></div>
+    </section>
+    <section>
       <h2>Host</h2>
       <div id="host" class="host-line">—</div>
     </section>
@@ -409,6 +465,51 @@ function renderIntellicar(rows) {
   }).join("");
 }
 
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s).replace(/[<&>"']/g, m => ({"<":"&lt;","&":"&amp;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
+}
+
+function renderTableSamples(samples) {
+  const root = document.getElementById("samples");
+  if (!samples || !samples.length) { root.innerHTML = '<div class="empty-msg">no data</div>'; return; }
+
+  // Preserve open/closed state across polls so the user's clicks stick.
+  const openSet = new Set(
+    [...root.querySelectorAll("details.sample-block[open]")].map(d => d.dataset.tbl)
+  );
+
+  root.innerHTML = samples.map(s => {
+    const tbl = s.table;
+    const open = openSet.has(tbl) ? "open" : "";
+    let body;
+    if (s.error) {
+      body = `<div class="err-msg">error: ${escapeHtml(s.error)}</div>`;
+    } else if (!s.rows || !s.rows.length) {
+      body = `<div class="empty-msg">empty</div>`;
+    } else {
+      const head = (s.columns || []).map(c => `<th>${escapeHtml(c)}</th>`).join("");
+      const body_rows = s.rows.map(r => {
+        const cells = r.map(v => {
+          if (v === null || v === undefined) return `<td class="cell-empty">∅</td>`;
+          const str = String(v);
+          return `<td title="${escapeHtml(str)}">${escapeHtml(str)}</td>`;
+        }).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+      body = `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body_rows}</tbody></table></div>`;
+    }
+    const meta = s.error
+      ? `<span class="meta" style="color:var(--red)">error</span>`
+      : `<span class="meta">${(s.rows || []).length} rows · ${(s.columns || []).length} cols</span>`;
+    return `
+      <details class="sample-block" data-tbl="${escapeHtml(tbl)}" ${open}>
+        <summary><span>${escapeHtml(tbl)}</span>${meta}</summary>
+        ${body}
+      </details>`;
+  }).join("");
+}
+
 function renderHost(h) {
   document.getElementById("host").textContent =
     `${h.hostname} · disk ${h.disk_used_gb}/${h.disk_total_gb} GB (${h.disk_pct}%) · ` +
@@ -468,6 +569,7 @@ async function tick() {
     renderHealth(data.health);
     renderFreshness(data.freshness);
     renderIntellicar(data.intellicar);
+    renderTableSamples(data.table_samples);
     renderHost(data.host);
     document.getElementById("updated").textContent =
       "updated " + new Date(data.generated_at).toLocaleTimeString();

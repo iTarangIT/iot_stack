@@ -7,6 +7,7 @@ auth; bound to 127.0.0.1 by compose, fronted by Caddy on the host.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shutil
@@ -150,6 +151,67 @@ def _fmt_ist(dt: datetime | None) -> str | None:
     return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
+# ─── Latest 5 rows per table — for the "Recent rows" section ───────────────
+# Tuple is (table_name, ORDER BY clause). Each table is queried independently
+# so a missing/dropped table doesn't kill the rest.
+TABLE_SAMPLES: list[tuple[str, str]] = [
+    ("vehicle_state",                 "ORDER BY updated_at DESC NULLS LAST"),
+    ("telemetry_gps",                 "ORDER BY time DESC"),
+    ("telemetry_battery",             "ORDER BY time DESC"),
+    ("telemetry_can",                 "ORDER BY time DESC"),
+    ("telemetry_fuel",                "ORDER BY time DESC"),
+    ("alerts",                        "ORDER BY time DESC"),
+    ("distance_rollup",               "ORDER BY time DESC"),
+    ("vehicles",                      "ORDER BY info_updated DESC NULLS LAST"),
+    ("dashboard_nbfc_loans_with_iot", "ORDER BY refreshed_at DESC NULLS LAST"),
+    ("aggregator_runs",               "ORDER BY started_at DESC NULLS LAST"),
+]
+MAX_CELL_LEN = 200
+
+
+def _truncate_cell(v: Any) -> Any:
+    if v is None or isinstance(v, (bool, int, float)):
+        return v
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
+    if isinstance(v, (dict, list)):
+        s = json.dumps(v, default=str)
+    else:
+        s = str(v)
+    if len(s) > MAX_CELL_LEN:
+        return s[:MAX_CELL_LEN] + "…"
+    return s
+
+
+def _table_samples() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        with psycopg.connect(PG_DSN, connect_timeout=2) as conn:
+            for table, order_by in TABLE_SAMPLES:
+                err: str | None = None
+                cols: list[str] = []
+                rows: list[list[Any]] = []
+                try:
+                    with conn.cursor() as cur:
+                        # Static identifiers — not user input — safe to interpolate.
+                        cur.execute(f"SELECT * FROM {table} {order_by} LIMIT 5")
+                        cols = [d.name for d in (cur.description or [])]
+                        for r in cur.fetchall():
+                            rows.append([_truncate_cell(v) for v in r])
+                except Exception as e:
+                    err = str(e)[:200]
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                out.append({"table": table, "columns": cols, "rows": rows, "error": err})
+    except Exception as e:
+        return [{"table": "_db_error", "columns": [], "rows": [], "error": str(e)}]
+    return out
+
+
 def _intellicar_endpoints() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
@@ -251,5 +313,6 @@ def api_status(_: None = Depends(require_auth)) -> JSONResponse:
         },
         "freshness": _freshness(),
         "intellicar": _intellicar_endpoints(),
+        "table_samples": _table_samples(),
         "host": _host(),
     })
