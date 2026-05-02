@@ -102,6 +102,20 @@
   tr:last-child td { border-bottom: none; }
   td.num { text-align: right; }
   td.muted { color: var(--muted); }
+  td.stale { color: var(--yellow); }
+  td.bad   { color: var(--red); }
+  .tag {
+    display: inline-block;
+    padding: 1px 6px;
+    margin: 1px 4px 1px 0;
+    border-radius: 3px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--text);
+  }
+  .endpoint-name { color: var(--blue); }
   .host-line { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   /* ── architecture diagram ── */
   .arch-wrap {
@@ -172,10 +186,13 @@
             </defs>
 
             <!-- external sources (top row) -->
-            <g class="ext">
-              <rect x="80"  y="20" width="200" height="44" rx="4"></rect>
-              <text x="180" y="42">Intellicar API</text>
-              <text x="180" y="56" class="sub" style="fill:var(--muted);font-size:10px">cloud · 30s polling</text>
+            <g class="ext" id="ext-intellicar">
+              <rect x="40" y="10" width="280" height="92" rx="4"></rect>
+              <text x="180" y="30">Intellicar API</text>
+              <text x="180" y="46" class="sub" style="fill:var(--muted);font-size:10px">apiplatform.intellicar.in/api/standard</text>
+              <text x="180" y="64" class="sub" style="fill:var(--muted);font-size:10px">30s loop · getlastgpsstatus, getlatestcan</text>
+              <text x="180" y="78" class="sub" style="fill:var(--muted);font-size:10px">daily 01:05 UTC · 6 history endpoints</text>
+              <text x="180" y="92" class="sub" style="fill:var(--muted);font-size:10px">hourly · listvehicles, listusers, …</text>
             </g>
             <g class="ext">
               <rect x="640" y="20" width="200" height="44" rx="4"></rect>
@@ -226,7 +243,7 @@
 
             <!-- edges -->
             <!-- Intellicar → poller -->
-            <path class="edge" d="M180,64 L180,120" marker-end="url(#arr)"></path>
+            <path class="edge" d="M180,102 L180,120" marker-end="url(#arr)"></path>
             <!-- AWS RDS → aggregator -->
             <path class="edge" d="M740,64 L740,120" marker-end="url(#arr)"></path>
             <!-- poller → postgres -->
@@ -268,6 +285,21 @@
       <h2>Postgres data freshness</h2>
       <table id="freshness">
         <thead><tr><th>Table</th><th class="num">Rows</th><th>Last update</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Intellicar API endpoints</h2>
+      <table id="intellicar">
+        <thead>
+          <tr>
+            <th>Endpoint</th>
+            <th>Schedule</th>
+            <th>Writes to</th>
+            <th>Last run (IST)</th>
+            <th class="num">Age</th>
+          </tr>
+        </thead>
         <tbody></tbody>
       </table>
     </section>
@@ -340,6 +372,43 @@ function renderFreshness(rows) {
   `).join("");
 }
 
+function humanAge(sec) {
+  if (sec == null) return "—";
+  if (sec < 60)    return sec + "s";
+  if (sec < 3600)  return Math.floor(sec / 60) + "m";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h";
+  return Math.floor(sec / 86400) + "d";
+}
+
+function staleThresholdSec(schedule) {
+  // Returns seconds — beyond this, the row is flagged stale (yellow).
+  if (!schedule) return 24 * 3600;
+  if (schedule.includes("30s")) return 5 * 60;        // 5 min — generous, poll runs every 30s
+  if (schedule.includes("1h"))  return 2 * 3600;      // 2 hours — refresh_roster runs hourly
+  if (schedule.includes("daily")) return 26 * 3600;   // 26 hours — daily run + 2h grace
+  return 24 * 3600;
+}
+
+function renderIntellicar(rows) {
+  const tbody = document.querySelector("#intellicar tbody");
+  if (!rows || !rows.length) { tbody.innerHTML = ""; return; }
+  tbody.innerHTML = rows.map(r => {
+    const threshold = staleThresholdSec(r.schedule);
+    const isStale = r.age_sec != null && r.age_sec > threshold;
+    const cellCls = r.error ? "bad" : (isStale ? "stale" : "muted");
+    const tags = (r.tables || []).map(t => `<span class="tag">${t}</span>`).join("");
+    const url  = r.url || "";
+    return `
+      <tr>
+        <td><span class="endpoint-name" title="${url}">${r.endpoint}</span></td>
+        <td class="muted">${r.schedule || "—"}</td>
+        <td>${tags}</td>
+        <td class="${cellCls}">${r.last_run_ist || (r.error ? "error: " + r.error.slice(0,60) : "never")}</td>
+        <td class="num ${cellCls}">${humanAge(r.age_sec)}</td>
+      </tr>`;
+  }).join("");
+}
+
 function renderHost(h) {
   document.getElementById("host").textContent =
     `${h.hostname} · disk ${h.disk_used_gb}/${h.disk_total_gb} GB (${h.disk_pct}%) · ` +
@@ -398,6 +467,7 @@ async function tick() {
     renderContainers(data.containers);
     renderHealth(data.health);
     renderFreshness(data.freshness);
+    renderIntellicar(data.intellicar);
     renderHost(data.host);
     document.getElementById("updated").textContent =
       "updated " + new Date(data.generated_at).toLocaleTimeString();

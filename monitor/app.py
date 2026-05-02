@@ -14,6 +14,7 @@ import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import docker
 import httpx
@@ -37,6 +38,29 @@ SERVICES = [
     "itarang_poller",
     "itarang_aggregator",
     "itarang_risk_sandbox",
+]
+
+IST = ZoneInfo("Asia/Kolkata")
+
+# ─── Intellicar endpoints we ingest ─────────────────────────────────────────
+# Per-endpoint last-run timestamp is derived from MAX(<col>) of whichever
+# table that endpoint primarily writes to. Not perfect — for daily-history
+# endpoints this is "newest sample" not "last fetch" — but close enough
+# without adding a tracking table. (Adding intellicar_endpoint_runs would
+# be a schema migration; not worth it for a status dashboard.)
+INTELLICAR_BASE = "https://apiplatform.intellicar.in/api/standard"
+INTELLICAR_ENDPOINTS = [
+    # endpoint                     schedule                        target tables                                  last-run table         col
+    ("listvehicles",               "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated"),
+    ("listusers",                  "every 1h (refresh_roster)",    ["vehicles (roster)"],                          "vehicles",            "info_updated"),
+    ("listvehicledevicemapping",   "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated"),
+    ("getlastgpsstatus",           "every 30s (poll_state)",       ["telemetry_gps", "vehicle_state"],             "telemetry_gps",       "time"),
+    ("getlatestcan",               "every 30s (poll_state)",       ["telemetry_can", "vehicle_state"],             "telemetry_can",       "time"),
+    ("getbatterymetricshistory",   "daily 01:05 UTC (poll_daily)", ["telemetry_battery", "vehicle_state"],         "telemetry_battery",   "time"),
+    ("getgpshistory",              "daily 01:05 UTC (poll_daily)", ["telemetry_gps"],                              "telemetry_gps",       "time"),
+    ("getfuelhistory",             "daily 01:05 UTC (poll_daily)", ["telemetry_fuel"],                             "telemetry_fuel",      "time"),
+    ("getdistancetravelled",       "daily 01:05 UTC (poll_daily)", ["distance_rollup"],                            "distance_rollup",     "time"),
+    ("getvehicleinfo",             "daily 01:05 UTC (poll_daily)", ["vehicles"],                                   "vehicles",            "info_updated"),
 ]
 
 # Same SELECT block as scripts/status.sh:26-32. Kept identical so terminal
@@ -118,6 +142,52 @@ def _check_risk_sandbox() -> dict[str, Any]:
         return {"ok": False, "detail": str(e)}
 
 
+def _fmt_ist(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def _intellicar_endpoints() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    try:
+        with psycopg.connect(PG_DSN, connect_timeout=2) as conn:
+            for endpoint, schedule, tables, src_table, src_col in INTELLICAR_ENDPOINTS:
+                last: datetime | None = None
+                err: str | None = None
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT MAX({src_col}) FROM {src_table}")
+                        row = cur.fetchone()
+                        last = row[0] if row else None
+                except Exception as e:
+                    err = str(e)[:200]
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                if last and last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                age = int((now - last).total_seconds()) if last else None
+                out.append({
+                    "endpoint": endpoint,
+                    "url": f"{INTELLICAR_BASE}/{endpoint}",
+                    "schedule": schedule,
+                    "tables": tables,
+                    "last_run_utc": last.isoformat() if last else None,
+                    "last_run_ist": _fmt_ist(last),
+                    "age_sec": age,
+                    "error": err,
+                })
+    except Exception as e:
+        return [{"endpoint": "_db_error", "url": None, "schedule": None, "tables": [],
+                 "last_run_utc": None, "last_run_ist": None, "age_sec": None, "error": str(e)}]
+    return out
+
+
 def _freshness() -> list[dict[str, Any]]:
     try:
         with psycopg.connect(PG_DSN, connect_timeout=2) as conn:
@@ -180,5 +250,6 @@ def api_status(_: None = Depends(require_auth)) -> JSONResponse:
             "risk_sandbox": _check_risk_sandbox(),
         },
         "freshness": _freshness(),
+        "intellicar": _intellicar_endpoints(),
         "host": _host(),
     })

@@ -125,6 +125,33 @@ def evaluate(status: dict[str, Any], diagram_states: dict[str, str]) -> list[Che
         f"{len(diagram_states)} nodes scanned" if not bad_nodes else f"red nodes: {', '.join(bad_nodes)}",
     ))
 
+    # 5. Intellicar endpoints — every endpoint must have a last_run_utc and
+    # not be older than its schedule's threshold.
+    SCHEDULE_THRESHOLDS_SEC = {
+        "30s":   5 * 60,
+        "1h":    2 * 3600,
+        "daily": 26 * 3600,
+    }
+    for ep in status.get("intellicar") or []:
+        name = ep.get("endpoint", "?")
+        if name == "_db_error":
+            results.append(CheckResult("intellicar endpoints (db)", False, ep.get("error") or "db error"))
+            continue
+        sched = ep.get("schedule") or ""
+        threshold = next((s for k, s in SCHEDULE_THRESHOLDS_SEC.items() if k in sched), 24 * 3600)
+        age = ep.get("age_sec")
+        if ep.get("error"):
+            results.append(CheckResult(f"endpoint {name}", False, f"error: {ep['error'][:80]}"))
+        elif age is None:
+            results.append(CheckResult(f"endpoint {name}", False, "never run"))
+        else:
+            ok = age <= threshold
+            results.append(CheckResult(
+                f"endpoint {name}",
+                ok,
+                f"last={ep.get('last_run_ist')} age={age}s threshold={threshold}s",
+            ))
+
     return results
 
 
