@@ -232,7 +232,12 @@ jobs:
             FOUND=no
             for i in $(seq 1 90); do
               sleep 1
-              if docker compose logs --tail=200 aggregator 2>/dev/null | grep -q 'scheduler started'; then
+              # Match the cold-start banner OR a per-job summary line — the banner
+              # only appears once at boot and rolls past --tail=200 if the
+              # aggregator wasn't recreated this deploy. Either pattern proves
+              # the scheduler is alive and processing jobs.
+              if docker compose logs --tail=200 aggregator 2>/dev/null \
+                 | grep -qE 'scheduler started|\[aggregator\] job .* done'; then
                 FOUND=yes; echo "aggregator scheduler started after ${i}s"; break
               fi
             done
