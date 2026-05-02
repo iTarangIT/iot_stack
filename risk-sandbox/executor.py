@@ -75,6 +75,7 @@ class ExecuteResponse(BaseModel):
 app = FastAPI(title="risk-sandbox", version="0.1")
 
 
+@app.get("/health")
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
