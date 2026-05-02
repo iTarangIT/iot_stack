@@ -103,6 +103,50 @@
   td.num { text-align: right; }
   td.muted { color: var(--muted); }
   .host-line { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  /* ── architecture diagram ── */
+  .arch-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+  }
+  .arch svg { display: block; max-width: 100%; height: auto; }
+  .arch .node rect {
+    fill: var(--panel-2);
+    stroke: var(--border);
+    stroke-width: 1.5;
+    transition: fill 0.3s, stroke 0.3s;
+  }
+  .arch .node text {
+    fill: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    text-anchor: middle;
+    dominant-baseline: middle;
+    pointer-events: none;
+  }
+  .arch .node .sub {
+    fill: var(--muted);
+    font-size: 10px;
+  }
+  .arch .node.ok rect    { fill: rgba(63,185,80,0.14);  stroke: var(--green); }
+  .arch .node.bad rect   { fill: rgba(248,81,73,0.14);  stroke: var(--red); }
+  .arch .node.warn rect  { fill: rgba(210,153,34,0.14); stroke: var(--yellow); }
+  .arch .ext rect {
+    fill: transparent;
+    stroke: var(--border);
+    stroke-dasharray: 4 3;
+  }
+  .arch .ext text { fill: var(--muted); font-style: italic; }
+  .arch .edge { stroke: var(--border); stroke-width: 1.5; fill: none; }
+  .arch .edge-label { fill: var(--muted); font-family: var(--mono); font-size: 10px; }
+  .arch-legend { display: flex; gap: 16px; margin-top: 12px; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .arch-legend .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: middle; border: 1px solid var(--border); }
+  .arch-legend .ok    { background: rgba(63,185,80,0.4); border-color: var(--green); }
+  .arch-legend .bad   { background: rgba(248,81,73,0.4); border-color: var(--red); }
+  .arch-legend .warn  { background: rgba(210,153,34,0.4); border-color: var(--yellow); }
+  .arch-legend .idle  { background: var(--panel-2); }
   @media (max-width: 700px) { .health-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -115,6 +159,103 @@
     </div>
   </header>
   <main>
+    <section>
+      <h2>Architecture</h2>
+      <div class="arch-wrap">
+        <div class="arch">
+          <svg viewBox="0 0 920 460" role="img" aria-label="System architecture">
+            <!-- arrow marker -->
+            <defs>
+              <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"></path>
+              </marker>
+            </defs>
+
+            <!-- external sources (top row) -->
+            <g class="ext">
+              <rect x="80"  y="20" width="200" height="44" rx="4"></rect>
+              <text x="180" y="42">Intellicar API</text>
+              <text x="180" y="56" class="sub" style="fill:var(--muted);font-size:10px">cloud · 30s polling</text>
+            </g>
+            <g class="ext">
+              <rect x="640" y="20" width="200" height="44" rx="4"></rect>
+              <text x="740" y="42">AWS RDS (NBFC)</text>
+              <text x="740" y="56" class="sub" style="fill:var(--muted);font-size:10px">read-only loans/borrowers</text>
+            </g>
+
+            <!-- ingest row -->
+            <g id="node-poller" class="node">
+              <rect x="100" y="120" width="160" height="56" rx="6"></rect>
+              <text x="180" y="142">poller</text>
+              <text x="180" y="160" class="sub">Python · ingest</text>
+            </g>
+            <g id="node-aggregator" class="node">
+              <rect x="660" y="120" width="160" height="56" rx="6"></rect>
+              <text x="740" y="142">aggregator</text>
+              <text x="740" y="160" class="sub">cron · joins → dashboard_*</text>
+            </g>
+
+            <!-- data layer -->
+            <g id="node-postgres" class="node">
+              <rect x="240" y="220" width="240" height="62" rx="6"></rect>
+              <text x="360" y="244">postgres</text>
+              <text x="360" y="262" class="sub">TimescaleDB · raw + dashboard_*</text>
+            </g>
+            <g id="node-redis" class="node">
+              <rect x="520" y="220" width="160" height="62" rx="6"></rect>
+              <text x="600" y="244">redis</text>
+              <text x="600" y="262" class="sub">poller hot-state cache</text>
+            </g>
+
+            <!-- consumers row -->
+            <g id="node-risk_sandbox" class="node">
+              <rect x="100" y="340" width="200" height="56" rx="6"></rect>
+              <text x="200" y="362">risk-sandbox</text>
+              <text x="200" y="380" class="sub">FastAPI · LangGraph runs</text>
+            </g>
+            <g id="node-monitor" class="node">
+              <rect x="380" y="340" width="180" height="56" rx="6"></rect>
+              <text x="470" y="362">monitor</text>
+              <text x="470" y="380" class="sub">this page</text>
+            </g>
+            <g class="ext">
+              <rect x="620" y="340" width="220" height="56" rx="6"></rect>
+              <text x="730" y="362">Next.js CRM</text>
+              <text x="730" y="380" class="sub" style="fill:var(--muted);font-size:10px">reads dashboard_* via bridge</text>
+            </g>
+
+            <!-- edges -->
+            <!-- Intellicar → poller -->
+            <path class="edge" d="M180,64 L180,120" marker-end="url(#arr)"></path>
+            <!-- AWS RDS → aggregator -->
+            <path class="edge" d="M740,64 L740,120" marker-end="url(#arr)"></path>
+            <!-- poller → postgres -->
+            <path class="edge" d="M200,176 C200,200 280,200 300,220" marker-end="url(#arr)"></path>
+            <!-- poller → redis -->
+            <path class="edge" d="M240,176 C300,180 540,200 560,220" marker-end="url(#arr)"></path>
+            <!-- aggregator → postgres -->
+            <path class="edge" d="M720,176 C700,200 460,210 440,220" marker-end="url(#arr)"></path>
+            <!-- postgres → risk-sandbox -->
+            <path class="edge" d="M320,282 C300,310 220,320 200,340" marker-end="url(#arr)"></path>
+            <!-- postgres → monitor -->
+            <path class="edge" d="M380,282 C400,310 460,320 470,340" marker-end="url(#arr)"></path>
+            <!-- redis → monitor -->
+            <path class="edge" d="M580,282 C540,310 500,320 490,340" marker-end="url(#arr)"></path>
+            <!-- postgres → Next.js CRM -->
+            <path class="edge" d="M460,282 C520,310 680,320 700,340" marker-end="url(#arr)"></path>
+            <!-- risk-sandbox ← Next.js CRM (request) -->
+            <path class="edge" d="M620,368 L300,368" marker-end="url(#arr)" stroke-dasharray="4 3"></path>
+            <text class="edge-label" x="460" y="360">on-demand /execute</text>
+          </svg>
+        </div>
+        <div class="arch-legend">
+          <span><span class="swatch ok"></span>healthy</span>
+          <span><span class="swatch warn"></span>degraded</span>
+          <span><span class="swatch bad"></span>down</span>
+          <span><span class="swatch idle"></span>unknown / external</span>
+        </div>
+      </div>
+    </section>
     <section>
       <h2>Containers</h2>
       <div id="containers" class="grid"></div>
@@ -205,12 +346,55 @@ function renderHost(h) {
     `mem ${h.mem_used_mb}/${h.mem_total_mb} MB · load ${h.load.join(" ")}`;
 }
 
+function setNodeState(id, state) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove("ok", "bad", "warn");
+  if (state) el.classList.add(state);
+}
+
+function nodeStateForContainer(c) {
+  if (!c) return null;
+  if (c.state === "running") return c.restart_count > 5 ? "warn" : "ok";
+  if (c.state === "restarting" || c.state === "paused") return "warn";
+  return "bad";
+}
+
+function renderArchitecture(data) {
+  // Map service container names to SVG node ids.
+  const map = {
+    itarang_postgres: "node-postgres",
+    itarang_redis: "node-redis",
+    itarang_poller: "node-poller",
+    itarang_aggregator: "node-aggregator",
+    itarang_risk_sandbox: "node-risk_sandbox",
+    itarang_monitor: "node-monitor",
+  };
+  const byName = Object.fromEntries((data.containers || []).map(c => [c.name, c]));
+
+  // Container-derived state (covers poller, aggregator, monitor — no health endpoint).
+  for (const [name, id] of Object.entries(map)) {
+    setNodeState(id, nodeStateForContainer(byName[name]));
+  }
+
+  // Refine postgres / redis / risk-sandbox using their health probes — these
+  // are stricter than "container running" (catches "process up but bad creds").
+  const h = data.health || {};
+  if (h.postgres)     setNodeState("node-postgres",     h.postgres.ok ? "ok" : "bad");
+  if (h.redis)        setNodeState("node-redis",        h.redis.ok ? "ok" : "bad");
+  if (h.risk_sandbox) setNodeState("node-risk_sandbox", h.risk_sandbox.ok ? "ok" : "bad");
+
+  // Monitor itself: if this JS is running and the fetch succeeded, it's ok.
+  setNodeState("node-monitor", "ok");
+}
+
 async function tick() {
   const errEl = document.getElementById("err");
   try {
     const r = await fetch("/api/status", { credentials: "same-origin", cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
+    renderArchitecture(data);
     renderContainers(data.containers);
     renderHealth(data.health);
     renderFreshness(data.freshness);
