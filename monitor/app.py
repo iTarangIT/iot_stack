@@ -50,18 +50,26 @@ IST = ZoneInfo("Asia/Kolkata")
 # without adding a tracking table. (Adding intellicar_endpoint_runs would
 # be a schema migration; not worth it for a status dashboard.)
 INTELLICAR_BASE = "https://apiplatform.intellicar.in/api/standard"
+
+# Per-endpoint stale_threshold_sec is "if MAX(<col>) is older than this, flag yellow."
+# Values are deliberately loose for endpoints whose row-rate is bursty by design:
+#   - getlatestcan dedupes on (time, vehicleno); parked vehicles emit no new rows
+#     because can_t (= max field timestamp) stays constant. 30 min absorbs normal
+#     idle gaps without flagging healthy-but-quiet fleet periods.
+#   - daily history endpoints get rows timestamped for *yesterday*, so even
+#     immediately after the 01:05 UTC run, MAX(time) is ~24h old → 26h grace.
 INTELLICAR_ENDPOINTS = [
-    # endpoint                     schedule                        target tables                                  last-run table         col
-    ("listvehicles",               "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated"),
-    ("listusers",                  "every 1h (refresh_roster)",    ["vehicles (roster)"],                          "vehicles",            "info_updated"),
-    ("listvehicledevicemapping",   "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated"),
-    ("getlastgpsstatus",           "every 30s (poll_state)",       ["telemetry_gps", "vehicle_state"],             "telemetry_gps",       "time"),
-    ("getlatestcan",               "every 30s (poll_state)",       ["telemetry_can", "vehicle_state"],             "telemetry_can",       "time"),
-    ("getbatterymetricshistory",   "daily 01:05 UTC (poll_daily)", ["telemetry_battery", "vehicle_state"],         "telemetry_battery",   "time"),
-    ("getgpshistory",              "daily 01:05 UTC (poll_daily)", ["telemetry_gps"],                              "telemetry_gps",       "time"),
-    ("getfuelhistory",             "daily 01:05 UTC (poll_daily)", ["telemetry_fuel"],                             "telemetry_fuel",      "time"),
-    ("getdistancetravelled",       "daily 01:05 UTC (poll_daily)", ["distance_rollup"],                            "distance_rollup",     "time"),
-    ("getvehicleinfo",             "daily 01:05 UTC (poll_daily)", ["vehicles"],                                   "vehicles",            "info_updated"),
+    # endpoint                     schedule                        target tables                                   last-run table         col              stale_sec
+    ("listvehicles",               "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated",  2 * 3600),
+    ("listusers",                  "every 1h (refresh_roster)",    ["vehicles (roster)"],                          "vehicles",            "info_updated",  2 * 3600),
+    ("listvehicledevicemapping",   "every 1h (refresh_roster)",    ["vehicles"],                                   "vehicles",            "info_updated",  2 * 3600),
+    ("getlastgpsstatus",           "every 30s (poll_state)",       ["telemetry_gps", "vehicle_state"],             "telemetry_gps",       "time",          5 * 60),
+    ("getlatestcan",               "every 30s (poll_state)",       ["telemetry_can", "vehicle_state"],             "telemetry_can",       "time",          30 * 60),
+    ("getbatterymetricshistory",   "daily 01:05 UTC (poll_daily)", ["telemetry_battery", "vehicle_state"],         "telemetry_battery",   "time",          26 * 3600),
+    ("getgpshistory",              "daily 01:05 UTC (poll_daily)", ["telemetry_gps"],                              "telemetry_gps",       "time",          26 * 3600),
+    ("getfuelhistory",             "daily 01:05 UTC (poll_daily)", ["telemetry_fuel"],                             "telemetry_fuel",      "time",          26 * 3600),
+    ("getdistancetravelled",       "daily 01:05 UTC (poll_daily)", ["distance_rollup"],                            "distance_rollup",     "time",          26 * 3600),
+    ("getvehicleinfo",             "daily 01:05 UTC (poll_daily)", ["vehicles"],                                   "vehicles",            "info_updated",  26 * 3600),
 ]
 
 # Same SELECT block as scripts/status.sh:26-32. Kept identical so terminal
@@ -217,7 +225,7 @@ def _intellicar_endpoints() -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     try:
         with psycopg.connect(PG_DSN, connect_timeout=2) as conn:
-            for endpoint, schedule, tables, src_table, src_col in INTELLICAR_ENDPOINTS:
+            for endpoint, schedule, tables, src_table, src_col, stale_sec in INTELLICAR_ENDPOINTS:
                 last: datetime | None = None
                 err: str | None = None
                 try:
@@ -242,6 +250,7 @@ def _intellicar_endpoints() -> list[dict[str, Any]]:
                     "last_run_utc": last.isoformat() if last else None,
                     "last_run_ist": _fmt_ist(last),
                     "age_sec": age,
+                    "stale_threshold_sec": stale_sec,
                     "error": err,
                 })
     except Exception as e:

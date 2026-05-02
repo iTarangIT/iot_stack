@@ -126,7 +126,9 @@ def evaluate(status: dict[str, Any], diagram_states: dict[str, str]) -> list[Che
     ))
 
     # 5. Intellicar endpoints — every endpoint must have a last_run_utc and
-    # not be older than its schedule's threshold.
+    # not be older than its declared threshold. Prefer the server-provided
+    # stale_threshold_sec since some endpoints (e.g. getlatestcan) are
+    # bursty by design and need a looser bound than their 30s cadence.
     SCHEDULE_THRESHOLDS_SEC = {
         "30s":   5 * 60,
         "1h":    2 * 3600,
@@ -138,7 +140,9 @@ def evaluate(status: dict[str, Any], diagram_states: dict[str, str]) -> list[Che
             results.append(CheckResult("intellicar endpoints (db)", False, ep.get("error") or "db error"))
             continue
         sched = ep.get("schedule") or ""
-        threshold = next((s for k, s in SCHEDULE_THRESHOLDS_SEC.items() if k in sched), 24 * 3600)
+        threshold = ep.get("stale_threshold_sec")
+        if threshold is None:
+            threshold = next((s for k, s in SCHEDULE_THRESHOLDS_SEC.items() if k in sched), 24 * 3600)
         age = ep.get("age_sec")
         if ep.get("error"):
             results.append(CheckResult(f"endpoint {name}", False, f"error: {ep['error'][:80]}"))

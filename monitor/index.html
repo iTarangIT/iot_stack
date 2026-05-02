@@ -436,12 +436,16 @@ function humanAge(sec) {
   return Math.floor(sec / 86400) + "d";
 }
 
-function staleThresholdSec(schedule) {
-  // Returns seconds — beyond this, the row is flagged stale (yellow).
+function staleThresholdSec(ep) {
+  // Server now sends a per-endpoint stale_threshold_sec — prefer it over the
+  // schedule-string heuristic since some endpoints (getlatestcan) are bursty
+  // by design and need a looser threshold than their 30s cadence implies.
+  if (ep && typeof ep.stale_threshold_sec === "number") return ep.stale_threshold_sec;
+  const schedule = ep && ep.schedule;
   if (!schedule) return 24 * 3600;
-  if (schedule.includes("30s")) return 5 * 60;        // 5 min — generous, poll runs every 30s
-  if (schedule.includes("1h"))  return 2 * 3600;      // 2 hours — refresh_roster runs hourly
-  if (schedule.includes("daily")) return 26 * 3600;   // 26 hours — daily run + 2h grace
+  if (schedule.includes("30s"))   return 5 * 60;
+  if (schedule.includes("1h"))    return 2 * 3600;
+  if (schedule.includes("daily")) return 26 * 3600;
   return 24 * 3600;
 }
 
@@ -449,7 +453,7 @@ function renderIntellicar(rows) {
   const tbody = document.querySelector("#intellicar tbody");
   if (!rows || !rows.length) { tbody.innerHTML = ""; return; }
   tbody.innerHTML = rows.map(r => {
-    const threshold = staleThresholdSec(r.schedule);
+    const threshold = staleThresholdSec(r);
     const isStale = r.age_sec != null && r.age_sec > threshold;
     const cellCls = r.error ? "bad" : (isStale ? "stale" : "muted");
     const tags = (r.tables || []).map(t => `<span class="tag">${t}</span>`).join("");
