@@ -14,8 +14,9 @@
 # dashboard is now owned by the Next.js CRM, which reads dashboard_* tables
 # via the existing IoT-bridge Drizzle client.
 #
-# Port map (host-side, deliberately not changed from current production):
-#   5433 → postgres   (0.0.0.0 so Next.js CRM can reach it via VPS_PUBLIC_IP)
+# Port map (host-side):
+#   5433 → postgres   (127.0.0.1 only — same-host Next.js CRM PM2 service
+#                      connects via loopback. No public exposure.)
 #   6380 → redis      (127.0.0.1 only)
 #   8091 → risk-sandbox (127.0.0.1 only — Next.js calls via SSH tunnel or
 #                        internal proxy; never exposed publicly)
@@ -38,10 +39,13 @@ services:
       - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./schema/dashboard_aggregates.sql:/docker-entrypoint-initdb.d/02-dashboard-aggs.sql:ro
     ports:
-      # Exposed publicly so Next.js CRM (sandbox.itarang.com / crm.itarang.com)
-      # can reach this DB via VPS public IP. Tighten with UFW IP allowlist or
-      # Tailscale before this is anything other than dev data.
-      - "0.0.0.0:5433:5432"
+      # Loopback only. The same-host Next.js CRM (PM2 service on this VPS)
+      # connects via 127.0.0.1:5433. Other compose services reach this DB
+      # over the internal docker network (host `postgres:5432`), not via
+      # this host port. If a remote client ever genuinely needs access, do
+      # NOT change this binding — front it with Tailscale or an
+      # authenticated HTTPS proxy instead.
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U intellicar -d intellicar"]
       interval: 10s

@@ -41,14 +41,14 @@ The PHP "dashboard" container that used to ship with this stack is **retired**. 
 
 | Service       | Port (host)       | Build source       | What it does                                                  |
 | ------------- | ----------------- | ------------------ | ------------------------------------------------------------- |
-| `postgres`    | `0.0.0.0:5433`    | timescale/timescaledb:latest-pg16 | TimescaleDB — raw IoT + dashboard_* tables.    |
+| `postgres`    | `127.0.0.1:5433`  | timescale/timescaledb:latest-pg16 | TimescaleDB — raw IoT + dashboard_* tables.    |
 | `redis`       | `127.0.0.1:6380`  | redis:7-alpine     | Poller hot-state cache.                                       |
 | `poller`      | (no port)         | `./poller`         | Polls Intellicar API → writes Timescale + Redis.              |
 | `aggregator`  | (no port)         | `./aggregator`     | APScheduler-driven Python jobs → cross-source joins → dashboard_* tables. |
 | `risk-sandbox`| `127.0.0.1:8091`  | `./risk-sandbox`   | FastAPI sandbox for LangGraph hypothesis runs from /nbfc/risk. |
 | `monitor`     | `127.0.0.1:8092`  | `./monitor`        | HTML/JSON status page (containers, health, freshness). Behind Caddy + basic auth. |
 
-`postgres` is bound to `0.0.0.0:5433` because the Next.js CRM (sandbox + production) connects from outside the VPS. Lock this down with UFW IP allowlist or Tailscale before this is anything other than dev data.
+`postgres` is bound to `127.0.0.1:5433` only. The Next.js CRM runs as a host-level PM2 service on this same VPS and connects via the loopback interface; no other process needs port 5433. The other compose services (`poller`, `aggregator`, `monitor`, `risk-sandbox`) talk to postgres over the internal docker network as `postgres:5432`, not via the host port. If a remote client ever needs access, **do not** change this binding — set up Tailscale or an authenticated HTTPS proxy instead.
 
 ## Required GitHub Secrets
 
@@ -130,6 +130,29 @@ The "Detect schema changes" step refuses to deploy if `schema.sql`, `schema/*.sq
 
 (Mirrors the Drizzle policy in the CRM's `deploy-production.yml`.)
 
+## (Optional) Dedicated read-only role for the CRM
+
+The CRM currently connects to this DB as the superuser `intellicar`. To narrow that blast radius, provision a dedicated `crm_ro` role once after a fresh deploy and switch the CRM's IoT-bridge DSN to use it:
+
+```sh
+docker exec -i itarang_postgres \
+  psql -U intellicar -d intellicar -v crm_ro_password="'<long-random>'" <<'SQL'
+CREATE ROLE crm_ro WITH LOGIN PASSWORD :crm_ro_password;
+GRANT CONNECT ON DATABASE intellicar TO crm_ro;
+GRANT USAGE ON SCHEMA public TO crm_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO crm_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO crm_ro;
+SQL
+```
+
+Then update the CRM's IoT-bridge DSN (in the CRM repo's PM2 env / `.env`, **not** in this repo's `IOT_ENV_FILE_B64`) to:
+
+```
+postgresql://crm_ro:<password>@127.0.0.1:5433/intellicar
+```
+
+This is a follow-up hardening step and is not required for the loopback-only binding to work. Keep `iot_stack`'s schema customer-agnostic — the dealer ↔ vehicle mapping stays in the CRM (RDS-side `device_battery_map.vehicle_number == vehicleno`). Do not add `dealer_id` columns to `vehicles`, `vehicle_state`, or any other iot_stack table.
+
 ## Adding aggregator jobs
 
 Drop a new `.py` file in `aggregator/jobs/`:
@@ -187,7 +210,6 @@ docker compose up -d
 - **TLS / public domain.** CloudPanel/Caddy/Nginx in front does that.
 - **Secret rotation.** When you rotate `INTELLICAR_*` or `NBFC_RDS_DSN_RO`, regenerate `IOT_ENV_FILE_B64` and update the GitHub secret.
 - **Aggregator data-freshness alerts.** Add a Grafana / Uptime-Kuma alert on `MAX(refreshed_at)` for each `dashboard_*` table — that catches "aggregator is up but jobs are silently failing".
-- **Lock down postgres :5433.** Currently public. Tighten with UFW or Tailscale ASAP.
 
 ## Repo layout
 
