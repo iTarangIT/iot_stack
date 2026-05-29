@@ -56,3 +56,28 @@ CREATE INDEX IF NOT EXISTS dashboard_nbfc_loans_with_iot_tenant_idx
     ON dashboard_nbfc_loans_with_iot (tenant_id, current_dpd DESC);
 CREATE INDEX IF NOT EXISTS dashboard_nbfc_loans_with_iot_vehicleno_idx
     ON dashboard_nbfc_loans_with_iot (vehicleno);
+
+-- ─── jobs/vehicle_monthly_range.py — coulomb-counted range per veh per month ─
+-- One row per (vehicleno, first-of-month). The CRM dashboard reads two rows
+-- per vehicle through the dashboard_ro bridge: the current month, and the
+-- month three months prior, to render the "Range (this mo)" and "Δ 3-mo"
+-- columns. range_km is NULL when monthly_km < 50 or monthly_ah < 5
+-- (insufficient signal — see job for the formula).
+CREATE TABLE IF NOT EXISTS dashboard_vehicle_monthly_range (
+    vehicleno     TEXT        NOT NULL,
+    year_month    DATE        NOT NULL,         -- first of month, UTC
+    monthly_km    REAL        NULL,
+    monthly_ah    REAL        NULL,
+    range_km      REAL        NULL,
+    sample_count  INTEGER     NOT NULL DEFAULT 0,
+    refreshed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (vehicleno, year_month)
+);
+CREATE INDEX IF NOT EXISTS dashboard_vehicle_monthly_range_month_idx
+    ON dashboard_vehicle_monthly_range (year_month);
+
+-- Explicit grant so the dashboard bridge (dashboard_ro) can read this table
+-- regardless of which privileged role applies the migration. The
+-- ALTER DEFAULT PRIVILEGES in schema.sql only auto-grants when the SAME
+-- role that originally set the default creates the table.
+GRANT SELECT ON dashboard_vehicle_monthly_range TO dashboard_ro;
