@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.13-slim
 
 # Bare-minimum analysis stack. Pinned to avoid surprises.
 RUN pip install --no-cache-dir --root-user-action=ignore \
