@@ -126,7 +126,7 @@ class Poller:
             timeout=aiohttp.ClientTimeout(total=30, connect=10),
             headers={"User-Agent": "itarang-poller/3.0"},
         )
-        self.pg = await asyncpg.create_pool(PG_DSN, min_size=2, max_size=10)
+        self.pg = await asyncpg.create_pool(PG_DSN, min_size=10, max_size=50)
         self.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
         await self.refresh_token()
         await self.refresh_roster()
