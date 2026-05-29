@@ -50,7 +50,11 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Must exceed the deploy + rollback command_timeouts below (40m + 25m run
+    # sequentially in this job). A cold rebuild — base image moved or BuildKit
+    # cache evicted — can take ~24m (TimescaleDB re-pull + full pandas/numpy/scipy
+    # reinstall), which is what blew past the old 30m cap. See IOT_DEPLOY_README.md.
+    timeout-minutes: 55
     steps:
       # ──────────────────────────────────────────────────────────────────
       # 1. Slack notify start
@@ -102,7 +106,9 @@ jobs:
           username: ${{ secrets.IOT_VPS_USER }}
           port: ${{ secrets.IOT_VPS_PORT }}
           key: ${{ secrets.IOT_VPS_SSH_KEY }}
-          command_timeout: 25m
+          command_timeout: 40m      # headroom for a one-time cold rebuild (base
+                                    # image change / evicted cache ≈ 24m); warm
+                                    # deploys still finish in ~1m30s
           script_stop: false        # see deploy-production.yml retro
           script: |
             set -eo pipefail
@@ -274,7 +280,7 @@ jobs:
           username: ${{ secrets.IOT_VPS_USER }}
           port: ${{ secrets.IOT_VPS_PORT }}
           key: ${{ secrets.IOT_VPS_SSH_KEY }}
-          command_timeout: 15m
+          command_timeout: 25m      # rollback rebuild may also be cold
           script_stop: false
           script: |
             set -eo pipefail
