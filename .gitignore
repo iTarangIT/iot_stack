@@ -49,3 +49,6 @@ sample-data/
 
 # SSH keys / credentials
 keys/
+
+# VPS SSH credentials — never commit
+vps.env

@@ -79,10 +79,15 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       WORKER_ID: "0"
       WORKER_COUNT: "1"
-      CONCURRENCY: "50"
-      POLL_STATE_SEC: "30"
+      CONCURRENCY: "20"
+      POLL_STATE_SEC: "60"
       ROSTER_REFRESH_SEC: "3600"
       LOG_LEVEL: "INFO"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
     logging:
       driver: "json-file"
       options:
