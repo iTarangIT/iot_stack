@@ -122,6 +122,16 @@ jobs:
             # command_timeout, where the previously-running stack is untouched and
             # a destructive git-reset+rebuild would only revert good config.
             echo "start" > /tmp/itarang-iot-deploy-phase
+            # Distinct sentinel for the rollback gate. Only a *genuine* health
+            # failure (containers up, but a service never went healthy) writes
+            # "healthfail" via fail_health(); a fetch/build error or a
+            # command_timeout SIGKILL cannot, so the rollback step stays inert.
+            echo "running" > /tmp/itarang-iot-deploy-result
+            fail_health() { echo "healthfail" > /tmp/itarang-iot-deploy-result; exit 1; }
+            # Plain `docker logs` instead of `docker compose logs`: the latter
+            # hangs indefinitely on a running container on this host, which is
+            # what burned the whole command_timeout in the health-check loops.
+            dlogs() { timeout 15 docker logs --tail "$1" "$2" 2>&1 || true; }
 
             echo "::group::Capture PREV_SHA for rollback"
             PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
@@ -201,8 +211,8 @@ jobs:
             done
             if [ "$HTTP" != "ok" ]; then
               echo "❌ postgres pg_isready never returned 0"
-              docker compose logs --tail=80 postgres || true
-              exit 1
+              dlogs 80 itarang_postgres
+              fail_health
             fi
             echo "::endgroup::"
 
@@ -216,8 +226,8 @@ jobs:
             done
             if [ "$HTTP" != "ok" ]; then
               echo "❌ redis never returned PONG"
-              docker compose logs --tail=80 redis || true
-              exit 1
+              dlogs 80 itarang_redis
+              fail_health
             fi
             echo "::endgroup::"
 
@@ -230,8 +240,8 @@ jobs:
             done
             if [ "$HTTP" != "200" ]; then
               echo "❌ risk-sandbox /health returned $HTTP after 60s"
-              docker compose logs --tail=80 risk-sandbox || true
-              exit 1
+              dlogs 80 itarang_risk_sandbox
+              fail_health
             fi
             echo "::endgroup::"
 
@@ -239,19 +249,25 @@ jobs:
             STATUS=$(docker inspect -f '{{.State.Status}}' itarang_poller 2>/dev/null || echo "missing")
             if [ "$STATUS" != "running" ]; then
               echo "❌ itarang_poller status=$STATUS"
-              docker compose logs --tail=100 poller || true
-              exit 1
+              dlogs 100 itarang_poller
+              fail_health
             fi
-            FOUND=no
+            # Data-freshness via psql (reliable) instead of log-scraping
+            # (docker logs hangs intermittently on this host). vehicle_state.last_seen
+            # is bumped every poll cycle; allow ~2min for the first cycle after a
+            # poller restart.
+            FRESH=999999
             for i in $(seq 1 60); do
-              sleep 1
-              if docker compose logs --tail=200 poller 2>/dev/null | grep -qiE 'polling|fetched|state cycle|roster'; then
-                FOUND=yes; echo "poller log shows activity after ${i}s"; break
-              fi
+              FRESH=$(docker compose exec -T postgres psql -U intellicar -d intellicar -tAc \
+                "SELECT COALESCE(EXTRACT(EPOCH FROM now()-max(last_seen))::int, 999999) FROM vehicle_state" \
+                2>/dev/null | tr -dc '0-9' || echo 999999)
+              if [ "${FRESH:-999999}" -le 180 ] 2>/dev/null; then break; fi
+              sleep 2
             done
-            if [ "$FOUND" != "yes" ]; then
-              echo "⚠️  poller running but no recognised log activity in 60s — check INTELLICAR_USERNAME/PASSWORD"
-              docker compose logs --tail=120 poller || true
+            if [ "${FRESH:-999999}" -le 180 ] 2>/dev/null; then
+              echo "poller fresh: vehicle_state.last_seen ${FRESH}s ago"
+            else
+              echo "⚠️  poller running but vehicle_state stale (${FRESH}s) — check INTELLICAR_USERNAME/PASSWORD"
               # Non-fatal — credential failures are a separate class.
             fi
             echo "::endgroup::"
@@ -260,33 +276,26 @@ jobs:
             STATUS=$(docker inspect -f '{{.State.Status}}' itarang_aggregator 2>/dev/null || echo "missing")
             if [ "$STATUS" != "running" ]; then
               echo "❌ itarang_aggregator status=$STATUS"
-              docker compose logs --tail=120 aggregator || true
-              exit 1
+              dlogs 120 itarang_aggregator
+              fail_health
             fi
-            FOUND=no
-            for i in $(seq 1 90); do
-              sleep 1
-              # Match the cold-start banner OR a per-job summary line — the banner
-              # only appears once at boot and rolls past --tail=200 if the
-              # aggregator wasn't recreated this deploy. Either pattern proves
-              # the scheduler is alive and processing jobs.
-              if docker compose logs --tail=200 aggregator 2>/dev/null \
-                 | grep -qE 'scheduler started|\[aggregator\] job .* done'; then
-                FOUND=yes; echo "aggregator scheduler started after ${i}s"; break
-              fi
+            # Verify the aggregator is producing runs via the DB (aggregator_runs),
+            # not via logs. Non-fatal: job cadence varies and a deploy can land
+            # between jobs, so the container-status check above is the hard gate;
+            # the monitor service/Grafana track ongoing freshness.
+            RECENT_RUNS=0
+            for i in $(seq 1 20); do
+              RECENT_RUNS=$(docker compose exec -T postgres psql -U intellicar -d intellicar -tAc \
+                "SELECT count(*) FROM aggregator_runs WHERE started_at > now() - interval '15 minutes'" \
+                2>/dev/null | tr -dc '0-9' || echo 0)
+              if [ "${RECENT_RUNS:-0}" -ge 1 ] 2>/dev/null; then break; fi
+              sleep 3
             done
-            if [ "$FOUND" != "yes" ]; then
-              echo "❌ aggregator scheduler never reported started in 90s"
-              docker compose logs --tail=200 aggregator || true
-              exit 1
-            fi
-            # Bonus: check aggregator_runs row count climbed in the last 2min.
-            RECENT_RUNS=$(docker compose exec -T postgres psql -U intellicar -d intellicar -tAc \
-              "SELECT COUNT(*) FROM aggregator_runs WHERE started_at > now() - interval '2 minutes'" \
-              2>/dev/null || echo 0)
-            echo "aggregator_runs in last 2min: $RECENT_RUNS"
-            if [ "${RECENT_RUNS:-0}" = "0" ]; then
-              echo "⚠️  no aggregator runs persisted yet — may be normal on cold start. Check after 5min."
+            if [ "${RECENT_RUNS:-0}" -ge 1 ] 2>/dev/null; then
+              echo "aggregator healthy: ${RECENT_RUNS} run(s) in last 15min"
+            else
+              echo "⚠️  no aggregator_runs in last 15min — may be normal between jobs; check monitor/Grafana"
+              # Non-fatal — job cadence varies; container-status check above is the gate.
             fi
             echo "::endgroup::"
 
@@ -315,16 +324,18 @@ jobs:
             exec 2>&1
             APP_DIR=/opt/intellicar
             cd "$APP_DIR"
-            # Only roll back when the deploy actually replaced the running stack
-            # (phase 'up') and a health check then failed. If it died earlier
-            # (fetch/build error or command_timeout), the previous containers are
-            # still running untouched — a git-reset+rebuild would needlessly revert
-            # good committed config (this exact bug spiked the box for a day).
-            PHASE=$(cat /tmp/itarang-iot-deploy-phase 2>/dev/null || echo "")
-            if [ "$PHASE" != "up" ]; then
-              echo "Deploy failed at phase='$PHASE' (before new containers were brought up)."
-              echo "The previously-running stack was never replaced — skipping destructive rollback."
-              echo "Git is at the new SHA but the live containers are unchanged; re-run once the cause is fixed."
+            # Only roll back on a CONFIRMED health failure — i.e. the deploy
+            # brought the new containers up and a service never went healthy, so
+            # fail_health() wrote "healthfail". A fetch/build error or a
+            # command_timeout SIGKILL cannot write that sentinel, so we skip the
+            # destructive git-reset+rebuild there: the previously-running stack is
+            # untouched and reverting would only discard good committed config
+            # (this exact misfire spiked the box for a day, twice).
+            RESULT=$(cat /tmp/itarang-iot-deploy-result 2>/dev/null || echo "")
+            if [ "$RESULT" != "healthfail" ]; then
+              echo "No confirmed health failure (result='$RESULT') — most likely a build error"
+              echo "or a command_timeout. The live stack is untouched; skipping rollback."
+              echo "Investigate and re-run once the cause is fixed."
               exit 0
             fi
             PREV_SHA=$(cat /tmp/itarang-iot-prev-sha 2>/dev/null || echo "")
