@@ -116,6 +116,12 @@ jobs:
             set -x
             APP_DIR=/opt/intellicar
             cd "$APP_DIR"
+            # Phase sentinel: records how far this deploy got. The rollback step
+            # only reverts when we reach 'up' (new containers started, then a
+            # health check failed) — NEVER on a fetch/build failure or
+            # command_timeout, where the previously-running stack is untouched and
+            # a destructive git-reset+rebuild would only revert good config.
+            echo "start" > /tmp/itarang-iot-deploy-phase
 
             echo "::group::Capture PREV_SHA for rollback"
             PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
@@ -128,6 +134,22 @@ jobs:
             git reset --hard origin/main
             NEW_SHA=$(git rev-parse HEAD)
             git log -1 --oneline
+            echo "pulled" > /tmp/itarang-iot-deploy-phase
+            echo "::endgroup::"
+
+            echo "::group::Decide build vs config-only"
+            # A config-only change (docker-compose.yml, .env from the secret) needs
+            # no image rebuild — `up -d` applies it in seconds. Only rebuild when an
+            # app build context actually changed, so config tweaks can't be held
+            # hostage by a slow cold rebuild hitting command_timeout.
+            CHANGED=$(git diff --name-only "${PREV_SHA}"..HEAD 2>/dev/null || echo "")
+            echo "Changed since PREV_SHA:"; echo "$CHANGED"
+            if [ -z "$PREV_SHA" ] || echo "$CHANGED" | grep -qE '^(poller|aggregator|risk-sandbox|monitor)/|Dockerfile'; then
+              NEED_BUILD=1
+            else
+              NEED_BUILD=0
+            fi
+            echo "NEED_BUILD=$NEED_BUILD"
             echo "::endgroup::"
 
             echo "::group::Write .env from secret"
@@ -147,13 +169,19 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::Build app images (poller + aggregator + risk-sandbox)"
-            DOCKER_BUILDKIT=1 docker compose build --pull
+            if [ "$NEED_BUILD" = "1" ]; then
+              DOCKER_BUILDKIT=1 docker compose build --pull
+            else
+              echo "Config-only change — skipping rebuild; existing images reused."
+            fi
+            echo "built" > /tmp/itarang-iot-deploy-phase
             echo "::endgroup::"
 
             echo "::group::Recreate changed containers (up -d --remove-orphans)"
             # --remove-orphans drops the retired itarang_dashboard container
             # the first time this runs after the PHP dashboard removal.
             docker compose up -d --remove-orphans
+            echo "up" > /tmp/itarang-iot-deploy-phase
             echo "::endgroup::"
 
             echo "::group::docker compose ps"
@@ -287,6 +315,18 @@ jobs:
             exec 2>&1
             APP_DIR=/opt/intellicar
             cd "$APP_DIR"
+            # Only roll back when the deploy actually replaced the running stack
+            # (phase 'up') and a health check then failed. If it died earlier
+            # (fetch/build error or command_timeout), the previous containers are
+            # still running untouched — a git-reset+rebuild would needlessly revert
+            # good committed config (this exact bug spiked the box for a day).
+            PHASE=$(cat /tmp/itarang-iot-deploy-phase 2>/dev/null || echo "")
+            if [ "$PHASE" != "up" ]; then
+              echo "Deploy failed at phase='$PHASE' (before new containers were brought up)."
+              echo "The previously-running stack was never replaced — skipping destructive rollback."
+              echo "Git is at the new SHA but the live containers are unchanged; re-run once the cause is fixed."
+              exit 0
+            fi
             PREV_SHA=$(cat /tmp/itarang-iot-prev-sha 2>/dev/null || echo "")
             CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
             if [ -z "$PREV_SHA" ] || [ "$PREV_SHA" = "$CURRENT_SHA" ]; then
