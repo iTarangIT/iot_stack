@@ -80,7 +80,7 @@ services:
       WORKER_ID: "0"
       WORKER_COUNT: "1"
       CONCURRENCY: "20"
-      POLL_STATE_SEC: "60"
+      POLL_STATE_SEC: "300"
       ROSTER_REFRESH_SEC: "3600"
       LOG_LEVEL: "INFO"
     deploy:
