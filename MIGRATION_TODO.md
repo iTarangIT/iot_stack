@@ -55,22 +55,23 @@ This document has two halves:
   - boto3 creds come from the Fargate task IAM role in prod (needs
     `s3:PutObject` on the archive bucket). Do not put keys in env.
 
-### 1c. `schema_rds.sql` is missing 3 tables the aggregator REQUIRES  ⚠️ ACTION NEEDED
-The aggregator writes to tables that exist today in `schema/dashboard_aggregates.sql`
-but are **absent from `schema_rds.sql`**. On a fresh RDS load with `schema_rds.sql`
-alone, the aggregator crashes:
-| Table | Written by | Defined in |
-|-------|-----------|------------|
-| `aggregator_runs` | `aggregator/scheduler.py:89` (every job run) | `schema/dashboard_aggregates.sql:21` |
-| `dashboard_nbfc_loans_with_iot` | `aggregator/jobs/nbfc_loan_iot_join.py:58` | `schema/dashboard_aggregates.sql:38` |
-| `dashboard_vehicle_monthly_range` | `aggregator/jobs/vehicle_monthly_range.py:155` | `schema/dashboard_aggregates.sql:66` |
+### 1c. Aggregator metadata/dashboard tables  ✅ RESOLVED (merged into schema_rds.sql)
+The aggregator writes to three tables that originally lived only in
+`schema/dashboard_aggregates.sql` and were absent from `schema_rds.sql`, which
+would have crashed the aggregator on a fresh RDS load. They have now been
+**merged into `schema_rds.sql`** (new Section 6, before the role section), so the
+single file is self-sufficient:
+| Table | Written by | Now in |
+|-------|-----------|--------|
+| `aggregator_runs` | `aggregator/scheduler.py:89` (every job run) | `schema_rds.sql` §6 |
+| `dashboard_nbfc_loans_with_iot` | `aggregator/jobs/nbfc_loan_iot_join.py:58` | `schema_rds.sql` §6 |
+| `dashboard_vehicle_monthly_range` | `aggregator/jobs/vehicle_monthly_range.py:155` | `schema_rds.sql` §6 |
 
-`schema/dashboard_aggregates.sql` is **plain Postgres (no Timescale) and
-RDS-safe**. Pick one (see checklist step 3):
-- **Recommended:** apply `schema/dashboard_aggregates.sql` to RDS right after
-  `schema_rds.sql`, OR
-- merge those three tables into `schema_rds.sql` — **needs your confirmation**, I
-  did not edit `schema_rds.sql`.
+They are plain Postgres (no Timescale), have no foreign keys, and sit before the
+`dashboard_ro` role section so the blanket `GRANT SELECT ON ALL TABLES` covers
+them (the redundant explicit per-table grant from `dashboard_aggregates.sql` was
+dropped). `schema/dashboard_aggregates.sql` stays as the canonical source for the
+legacy Timescale stack but is **no longer needed for the RDS load**.
 
 `iot_archive_log` (the cold-archive ledger) is **not** in this list — the archive
 job self-creates it, so no schema action is needed for it.
@@ -135,8 +136,10 @@ job self-creates it, so no schema action is needed for it.
 | `.env.example` | **mod** — new interval + `IOT_ARCHIVE_*` vars, RDS DSN/sslmode notes |
 | `docker-compose.yml` | **mod** — aggregator env parity for the new vars |
 | `MIGRATION_TODO.md` | **new** — this file |
+| `aws migration/files (3)/schema_rds.sql` | **mod** — merged in the 3 aggregator/dashboard tables (§6) so it's a single complete file |
 
-Not touched (by scope): `schema_rds.sql`, `poller/poll.py`, anything in AWS.
+Not touched (by scope): `poller/poll.py`, `schema/dashboard_aggregates.sql`
+(kept as the legacy Timescale source), anything in AWS.
 
 ---
 
@@ -153,11 +156,10 @@ Not touched (by scope): `schema_rds.sql`, `poller/poll.py`, anything in AWS.
    only loads at boot). Fine to do now — nothing is live yet.
 
 ### Schema load
-3. Connect as `itarang_admin` to database `itarang` and run, in order:
-   1. `aws migration/files (3)/schema_rds.sql`
-   2. **`schema/dashboard_aggregates.sql`** ← required, or the aggregator crashes
-      (see gap 1c). Skip only if you instead merge those 3 tables into
-      `schema_rds.sql` (tell me to do that edit).
+3. Connect as `itarang_admin` to database `itarang` and run
+   `aws migration/files (3)/schema_rds.sql`. That single file is now complete —
+   it includes the aggregator/dashboard metadata tables (gap 1c), so you do **not**
+   need to apply `schema/dashboard_aggregates.sql` separately.
 4. Set the `dashboard_ro` password from Secrets Manager (gap 1g):
    `ALTER ROLE dashboard_ro PASSWORD '<from-secrets-manager>';`
 
