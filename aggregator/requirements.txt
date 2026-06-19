@@ -2,3 +2,6 @@ apscheduler==3.10.4
 psycopg[binary]==3.2.3
 pandas==2.2.3
 python-dateutil==2.9.0.post0
+# Cold-archive job (jobs/cold_archive_partitions.py) → S3. Pure-Python wheel,
+# no extra system deps needed in the Dockerfile.
+boto3==1.35.76
