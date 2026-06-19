@@ -111,6 +111,16 @@ services:
       INTERVAL_NBFC_LOAN_IOT: "300"
       INTERVAL_ALERTS_ROLLUP: "300"
       INTERVAL_DPD_RISK_SCORE: "3600"
+      # AWS-migration jobs (see MIGRATION_TODO.md). These have safe in-code
+      # defaults; the real target for prod is the Fargate task definition, not
+      # this compose file (which is retired with the VPS).
+      INTERVAL_REFRESH_DAILY_DISTANCE: "1800"   # 30 min — old continuous-agg cadence
+      INTERVAL_REFRESH_HOURLY_BATTERY: "900"    # 15 min — old continuous-agg cadence
+      INTERVAL_COLD_ARCHIVE: "86400"            # daily partition → S3 archive
+      IOT_ARCHIVE_S3_BUCKET: "${IOT_ARCHIVE_S3_BUCKET:-}"
+      IOT_ARCHIVE_S3_PREFIX: "${IOT_ARCHIVE_S3_PREFIX:-partitions}"
+      IOT_ARCHIVE_LEAD_DAYS: "${IOT_ARCHIVE_LEAD_DAYS:-3}"
+      IOT_ARCHIVE_RETENTION_JSON: "${IOT_ARCHIVE_RETENTION_JSON:-}"
     logging:
       driver: "json-file"
       options:
