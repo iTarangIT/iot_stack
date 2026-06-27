@@ -24,6 +24,7 @@ CREATE SCHEMA IF NOT EXISTS partman;                  -- partman keeps its objec
 -- (pg_stat_statements is loaded via shared_preload_libraries; no CREATE needed for it to work,
 --  but create it if you want the view:)
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_cron;                -- scheduler (RDS-supported; replaces pg_partman_bgw)
 
 -- =========================================================================
 -- 2. STATIC / SLOW-CHANGING TABLES  (unchanged from original)
@@ -290,17 +291,10 @@ END $$;
 
 -- =========================================================================
 -- 6. AGGREGATOR / DASHBOARD METADATA TABLES
+--    (merged from schema/dashboard_aggregates.sql - required by aggregator;
+--     plain Postgres, RDS-safe. Placed before role section so the blanket
+--     GRANT SELECT below covers them.)
 -- =========================================================================
--- Plain Postgres (no Timescale) — ported verbatim from
--- schema/dashboard_aggregates.sql so this file is self-sufficient. The
--- aggregator container writes these; without them it crashes on a fresh load.
--- No foreign keys, so order between them is free. They are created BEFORE the
--- dashboard_ro role section below, so the blanket
--- "GRANT SELECT ON ALL TABLES IN SCHEMA public" there covers them automatically.
-
--- ---- aggregator_runs : run log, written by aggregator/scheduler.py ----------
--- One row per job execution (success or failure). Useful for data-freshness
--- monitoring.
 CREATE TABLE IF NOT EXISTS aggregator_runs (
     id            BIGSERIAL PRIMARY KEY,
     job_name      TEXT        NOT NULL,
@@ -313,9 +307,6 @@ CREATE TABLE IF NOT EXISTS aggregator_runs (
 CREATE INDEX IF NOT EXISTS aggregator_runs_job_started_idx
     ON aggregator_runs (job_name, started_at DESC);
 
--- ---- dashboard_nbfc_loans_with_iot : written by jobs/nbfc_loan_iot_join.py --
--- Cross-source join for the CRM /nbfc/risk page: NBFC loans (from the NBFC RDS)
--- joined with the IoT slice from vehicle_state.
 CREATE TABLE IF NOT EXISTS dashboard_nbfc_loans_with_iot (
     loan_application_id    TEXT             PRIMARY KEY,
     tenant_id              TEXT             NULL,
@@ -338,12 +329,9 @@ CREATE INDEX IF NOT EXISTS dashboard_nbfc_loans_with_iot_tenant_idx
 CREATE INDEX IF NOT EXISTS dashboard_nbfc_loans_with_iot_vehicleno_idx
     ON dashboard_nbfc_loans_with_iot (vehicleno);
 
--- ---- dashboard_vehicle_monthly_range : written by jobs/vehicle_monthly_range.py
--- One row per (vehicleno, first-of-month). range_km is NULL when monthly_km < 50
--- or monthly_ah < 5 (insufficient signal — see the job for the formula).
 CREATE TABLE IF NOT EXISTS dashboard_vehicle_monthly_range (
     vehicleno     TEXT        NOT NULL,
-    year_month    DATE        NOT NULL,         -- first of month, UTC
+    year_month    DATE        NOT NULL,
     monthly_km    REAL        NULL,
     monthly_ah    REAL        NULL,
     range_km      REAL        NULL,
@@ -370,7 +358,14 @@ END $$;
 
 GRANT CONNECT ON DATABASE itarang TO dashboard_ro;
 GRANT USAGE ON SCHEMA public TO dashboard_ro;
--- Covers every table created above, including the Section 6 aggregator/dashboard
--- metadata tables — no per-table grant needed.
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO dashboard_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dashboard_ro;
+
+-- =========================================================================
+-- 8. pg_cron MAINTENANCE SCHEDULE
+--    (replaces the RDS-blocked pg_partman_bgw worker)
+--    Runs partition maintenance hourly: creates upcoming partitions and
+--    drops ones past their retention window.
+-- =========================================================================
+SELECT cron.schedule('partman-maintenance', '@hourly',
+  $$CALL partman.run_maintenance_proc()$$);
