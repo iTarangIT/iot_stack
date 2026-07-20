@@ -5,19 +5,33 @@ Itarang · Intellicar telemetry poller  (v3 — corrected API surface)
 Schedules
 ---------
   poll_state       every 30 s   getlastgpsstatus + getlatestcan per vehicle
+                                  → drives vehicle_state (live map) + telemetry_can
+  poll_recent      every  5 m   getbatterymetricshistory + getgpshistory over
+                                  (last_seen, now] per vehicle → telemetry_battery,
+                                  telemetry_gps at true 30-second resolution
   refresh_roster   every  1 h   listvehicles + listusers + listvehicledevicemapping
   poll_daily       cron 01:05 UTC   for each vehicle, fetch yesterday's:
-                                       · getbatterymetricshistory  → telemetry_battery
-                                       · getgpshistory             → telemetry_gps
                                        · getfuelhistory            → telemetry_fuel
                                        · getdistancetravelled      → distance_rollup
                                        then refresh getvehicleinfo
+                                  (battery + gps now handled by poll_recent)
+
+Why poll_recent
+---------------
+  getlatestcan / getlastgpsstatus return only the newest cached frame, so polling
+  them every 30 s cannot be denser than the device push cadence and — with no
+  unique (time, vehicleno) constraint — each identical re-read became a duplicate
+  row (measured ~84% dup in telemetry_can, ~63% in telemetry_gps). The *history*
+  endpoints return every device frame exactly once at 30-second resolution
+  (verified 30s median, ~0% dup in telemetry_battery); running them on a short
+  rolling window makes that data continuous instead of once-a-day.
 
 Stores
 ------
   Redis     : state:<vno> = JSON blob ; intellicar:token = cached JWT (12d TTL)
-  Postgres  : telemetry_gps, telemetry_can         (live, every 30 s)
-              telemetry_battery, telemetry_fuel    (daily backfill)
+  Postgres  : telemetry_can                        (live snapshot, every 30 s)
+              telemetry_battery, telemetry_gps     (rolling 30s history, every 5 m)
+              telemetry_fuel                       (daily backfill)
               distance_rollup                      (daily, bucket='day')
               vehicle_state                        (mirrors latest values)
               vehicles (info JSONB), alerts        (with hysteresis)
@@ -56,6 +70,15 @@ WORKER_COUNT        = int(os.environ.get("WORKER_COUNT", "1"))
 CONCURRENCY         = int(os.environ.get("CONCURRENCY", "50"))
 POLL_STATE_SEC      = int(os.environ.get("POLL_STATE_SEC", "30"))
 ROSTER_REFRESH_SEC  = int(os.environ.get("ROSTER_REFRESH_SEC", "3600"))
+# poll_recent pulls full-resolution *history* on a short interval so the
+# time-series tables carry true 30-second data continuously, instead of only via
+# the daily backfill. The "latest snapshot" endpoints (getlatestcan /
+# getlastgpsstatus) can never be denser than the device push cadence and, with no
+# unique (time, vehicleno) constraint, each identical re-read became a duplicate
+# row. The history endpoints return every device frame exactly once (verified: 30s
+# median, ~0% dupes in telemetry_battery).
+POLL_RECENT_SEC     = int(os.environ.get("POLL_RECENT_SEC", "300"))    # 5 min
+RECENT_LOOKBACK_H   = int(os.environ.get("RECENT_LOOKBACK_H", "48"))   # catch-up / outage self-heal cap
 DAILY_REFRESH_HOUR  = int(os.environ.get("DAILY_REFRESH_HOUR", "1"))   # UTC hour
 DAILY_REFRESH_MIN   = int(os.environ.get("DAILY_REFRESH_MIN",  "5"))
 LOG_LEVEL           = os.environ.get("LOG_LEVEL", "INFO")
@@ -300,20 +323,13 @@ class Poller:
             # ---- Postgres ----
             async with self.pg.acquire() as conn:
                 async with conn.transaction():
-                    if gps:
-                        await conn.execute(
-                            """INSERT INTO telemetry_gps
-                               (time, vehicleno, lat, lon, speed_kph, heading,
-                                ignition, gps_fix, ext_voltage)
-                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                               ON CONFLICT DO NOTHING""",
-                            gps_t, vno,
-                            gps.get("lat"), gps.get("lng"),
-                            gps.get("speed"), gps.get("heading"),
-                            to_bool(gps.get("ignstatus")),
-                            ((gps.get("fixquality") or 0) > 0),
-                            gps.get("vehbattery"),
-                        )
+                    # The live GPS snapshot is intentionally NOT appended to
+                    # telemetry_gps. getlastgpsstatus returns the same latest frame
+                    # every 30 s and, with no unique (time, vehicleno) constraint,
+                    # each re-insert was a fresh duplicate (~63% of telemetry_gps).
+                    # poll_recent now owns the GPS time-series via getgpshistory,
+                    # which returns each device frame exactly once. The live snapshot
+                    # still drives vehicle_state below for the real-time map.
                     if can:
                         await conn.execute(
                             "INSERT INTO telemetry_can (time, vehicleno, payload) "
@@ -399,6 +415,79 @@ class Poller:
                 now, vno)
 
     # =========================================================================
+    # poll_recent — every POLL_RECENT_SEC — rolling full-resolution history
+    # Pulls getbatterymetricshistory + getgpshistory over (last_seen, now] per
+    # vehicle so the time-series tables carry true 30-second data within minutes,
+    # not once a day. Each window starts strictly after that vehicle's high-water
+    # mark, so overlapping runs never duplicate (these hypertables have no unique
+    # (time, vehicleno) constraint). RECENT_LOOKBACK_H caps the catch-up so a
+    # first run / post-outage gap self-heals without an unbounded pull.
+    # =========================================================================
+    async def _high_water_marks(self, table: str) -> dict:
+        """Latest ingested `time` per vehicle, for building non-overlapping
+        history windows. Bounded to a recent span so the scan stays cheap."""
+        async with self.pg.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT vehicleno, max(time) AS hwm
+                    FROM {table}
+                    WHERE time >= now() - make_interval(hours => $1)
+                    GROUP BY vehicleno""",
+                RECENT_LOOKBACK_H + 24,
+            )
+        return {r["vehicleno"]: r["hwm"] for r in rows}
+
+    async def poll_recent(self) -> None:
+        if not self.vehicles:
+            return
+        now   = utc_now()
+        floor = now - timedelta(hours=RECENT_LOOKBACK_H)
+        end_epoch = int(now.timestamp() * 1000)
+        hwm_batt = await self._high_water_marks("telemetry_battery")
+        hwm_gps  = await self._high_water_marks("telemetry_gps")
+        counts = {"battery": 0, "gps": 0}
+
+        def window_start(hwm):
+            start = hwm or floor
+            if start < floor:
+                start = floor
+            # +1 ms: strictly after the last stored row, so we never re-pull and
+            # duplicate the boundary sample.
+            return int(start.timestamp() * 1000) + 1
+
+        async def one(vno: str):
+            b = g = 0
+            bs = window_start(hwm_batt.get(vno))
+            if bs < end_epoch:
+                try:
+                    resp = await self.post("getbatterymetricshistory", {
+                        "vehicleno": vno, "starttime": bs, "endtime": end_epoch})
+                    if resp.get("status") == "SUCCESS":
+                        b = await self._insert_battery_rows(vno, resp.get("data") or [])
+                except Exception as e:
+                    logging.warning("poll_recent battery(%s): %s", vno, e)
+            gs = window_start(hwm_gps.get(vno))
+            if gs < end_epoch:
+                try:
+                    resp = await self.post("getgpshistory", {
+                        "vehicleno": vno, "starttime": gs, "endtime": end_epoch})
+                    if resp.get("status") == "SUCCESS":
+                        g = await self._insert_gps_rows(vno, resp.get("data") or [])
+                except Exception as e:
+                    logging.warning("poll_recent gps(%s): %s", vno, e)
+            return (b, g)
+
+        start = time.monotonic()
+        results = await asyncio.gather(
+            *(one(v) for v in self.vehicles), return_exceptions=True)
+        for r in results:
+            if isinstance(r, tuple):
+                counts["battery"] += r[0]
+                counts["gps"]     += r[1]
+        logging.info("poll_recent: +%d battery, +%d gps rows in %.1fs (lookback<=%dh)",
+                     counts["battery"], counts["gps"],
+                     time.monotonic() - start, RECENT_LOOKBACK_H)
+
+    # =========================================================================
     # poll_daily — once per day at 01:05 UTC — backfill yesterday's history
     # =========================================================================
     async def poll_daily(self) -> None:
@@ -413,32 +502,15 @@ class Poller:
         logging.info("poll_daily start: backfilling %s → %s for %d vehicles",
                      start.isoformat(), end.isoformat(), len(self.vehicles))
 
-        counts = {"battery": 0, "gps": 0, "fuel": 0, "distance": 0, "info": 0}
+        counts = {"fuel": 0, "distance": 0, "info": 0}
 
         for vno in self.vehicles:
-            # 1. Battery history
-            try:
-                resp = await self.post("getbatterymetricshistory", {
-                    "vehicleno": vno,
-                    "starttime": start_epoch,
-                    "endtime":   end_epoch,
-                })
-                if resp.get("status") == "SUCCESS":
-                    counts["battery"] += await self._insert_battery_rows(vno, resp.get("data") or [])
-            except Exception as e:
-                logging.warning("getbatterymetricshistory(%s): %s", vno, e)
-
-            # 2. GPS history
-            try:
-                resp = await self.post("getgpshistory", {
-                    "vehicleno": vno,
-                    "starttime": start_epoch,
-                    "endtime":   end_epoch,
-                })
-                if resp.get("status") == "SUCCESS":
-                    counts["gps"] += await self._insert_gps_rows(vno, resp.get("data") or [])
-            except Exception as e:
-                logging.warning("getgpshistory(%s): %s", vno, e)
+            # Battery + GPS history are now pulled continuously by poll_recent
+            # (every POLL_RECENT_SEC over a rolling window), so they are
+            # intentionally NOT backfilled here — re-pulling the same window would
+            # duplicate rows, since these hypertables have no unique
+            # (time, vehicleno) constraint. poll_recent's wide lookback cap covers
+            # the same catch-up this daily pass used to provide.
 
             # 3. Fuel history
             try:
@@ -491,10 +563,9 @@ class Poller:
             except Exception as e:
                 logging.warning("getvehicleinfo(%s): %s", vno, e)
 
-        logging.info("poll_daily done: battery=%d rows, gps=%d rows, fuel=%d rows, "
-                     "distance=%d vehicles, info=%d vehicles",
-                     counts["battery"], counts["gps"], counts["fuel"],
-                     counts["distance"], counts["info"])
+        logging.info("poll_daily done: fuel=%d rows, distance=%d vehicles, "
+                     "info=%d vehicles (battery+gps now via poll_recent)",
+                     counts["fuel"], counts["distance"], counts["info"])
 
     async def _insert_battery_rows(self, vno: str, rows: list) -> int:
         if not rows:
@@ -621,6 +692,9 @@ async def main() -> None:
     sched.add_job(poller.poll_state,     "interval", seconds=POLL_STATE_SEC,
                   id="poll_state", max_instances=1, coalesce=True,
                   next_run_time=datetime.now())
+    sched.add_job(poller.poll_recent,    "interval", seconds=POLL_RECENT_SEC,
+                  id="poll_recent", max_instances=1, coalesce=True,
+                  next_run_time=datetime.now())
     sched.add_job(poller.refresh_roster, "interval", seconds=ROSTER_REFRESH_SEC,
                   id="refresh_roster")
     sched.add_job(poller.poll_daily,     "cron",
@@ -628,7 +702,8 @@ async def main() -> None:
                   id="poll_daily")
     sched.start()
 
-    logging.info("Scheduler started (state=30s, roster=1h, daily=01:05 UTC).")
+    logging.info("Scheduler started (state=%ds, recent=%ds, roster=1h, daily=01:05 UTC).",
+                 POLL_STATE_SEC, POLL_RECENT_SEC)
     try:
         await asyncio.Event().wait()
     finally:
